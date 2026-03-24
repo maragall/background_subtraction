@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bgsub"
+version = "0.1.0"
+description = "Minimal background subtraction for fluorescence microscopy acquisitions"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.9"
+authors = [
+    { name = "Cephla" },
+]
+keywords = [
+    "microscopy",
+    "background-subtraction",
+    "fluorescence",
+    "image-processing",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "numpy>=1.21",
+    "tifffile>=2023.0",
+    "photutils>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+gui = ["PyQt5>=5.15"]
+dev = ["ruff>=0.1"]
+
+[project.scripts]
+bgsub-gui = "gui.app:main"
+
+[project.urls]
+Repository = "https://github.com/maragall/background_subtraction"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bgsub", "gui", "scripts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
