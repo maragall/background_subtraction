@@ -29,7 +29,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.21",
     "tifffile>=2023.0",
-    "photutils>=2.0",
+    "sep>=1.2",
     "pyyaml>=6.0",
 ]
 

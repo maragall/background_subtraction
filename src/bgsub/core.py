@@ -1,26 +1,61 @@
-"""BackgroundSubtractor — background estimation and subtraction for microscopy acquisitions."""
+"""BackgroundSubtractor — sep-based background subtraction for microscopy acquisitions."""
 
+import itertools
+import os
+import shutil
+from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-from astropy.stats import SigmaClip
-from photutils.background import Background2D, MedianBackground
+import sep
+import tifffile
 
-from .io import (
-    detect_flat_tiffs,
-    detect_ome_tiff,
-    load_flat_tiffs_metadata,
-    load_ome_tiff_metadata,
-    read_frame,
-    read_plane,
-    write_frame,
-)
+from .readers import open_acquisition
 from .metrics import compute_metrics
+
+# sep uses ~3x the raw frame size in peak memory per worker.
+_MEM_MULTIPLIER = 3
+
+
+def _subtract_background(image: np.ndarray, box_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Run sep.Background on one 2D image. Returns (foreground, background)."""
+    img = np.ascontiguousarray(image, dtype=np.float32)
+    bkg = sep.Background(img, bw=box_size, bh=box_size, fw=3, fh=3)
+    bg = bkg.back()
+    fg = img - bg
+    return fg, bg
+
+
+def _process_frame_worker(args):
+    """Picklable worker: read frame from file, subtract background, write output."""
+    file_path_str, page_idx, output_dir, box_size, dtype_str, out_name = args
+    import sep as _sep, numpy as _np, tifffile as _tf
+
+    if page_idx >= 0:
+        image = _tf.imread(file_path_str, key=page_idx)
+    else:
+        image = _tf.imread(file_path_str)
+
+    img = _np.ascontiguousarray(image, dtype=_np.float32)
+    bkg = _sep.Background(img, bw=box_size, bh=box_size, fw=3, fh=3)
+    fg = img - bkg.back()
+
+    out_path = Path(output_dir) / out_name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    info = _np.iinfo(_np.dtype(dtype_str))
+    clipped = _np.clip(fg, info.min, info.max).astype(_np.dtype(dtype_str))
+    _tf.imwrite(str(out_path), clipped)
+    return out_name
 
 
 class BackgroundSubtractor:
-    """Orchestrates photutils Background2D subtraction across an acquisition.
+    """Orchestrates sep-based background subtraction across an acquisition.
+
+    Supports all formats via the readers module:
+      - Individual TIFFs (*_Fluorescence_*_nm_Ex*.tiff)
+      - OME-TIFF (ome_tiff/*.ome.tiff)
+      - CurrentStack (*_stack.tiff)
 
     Parameters
     ----------
@@ -29,7 +64,9 @@ class BackgroundSubtractor:
     output_path : str or Path, optional
         Where to write results. Defaults to input_path / "background_subtracted".
     box_size : int
-        Box size for Background2D grid estimation (pixels).
+        Box size for background grid estimation (pixels).
+    max_workers : int, optional
+        Number of parallel workers. Auto-detected from available memory if None.
     """
 
     def __init__(
@@ -37,143 +74,155 @@ class BackgroundSubtractor:
         input_path,
         output_path=None,
         box_size=50,
+        max_workers=None,
     ):
         self.input_path = Path(input_path)
         self.output_path = (
             Path(output_path) if output_path else self.input_path / "background_subtracted"
         )
         self.box_size = box_size
-        self._format = None
-        self._metadata = None
+        self.max_workers = max_workers
+        self._acq = None
 
-    def detect_format(self) -> str:
-        if self._format:
-            return self._format
-        if detect_ome_tiff(self.input_path):
-            self._format = "ome_tiff"
-        elif detect_flat_tiffs(self.input_path):
-            self._format = "flat_tiffs"
-        else:
-            raise ValueError(
-                f"Unrecognized acquisition format in {self.input_path}. "
-                "Expected flat TIFFs or OME-TIFF with acquisition.yaml."
-            )
-        return self._format
+    @property
+    def acq(self):
+        """Lazy-load the AcquisitionReader."""
+        if self._acq is None:
+            self._acq = open_acquisition(self.input_path)
+        return self._acq
 
-    def load_metadata(self) -> dict:
-        if self._metadata:
-            return self._metadata
-        fmt = self.detect_format()
-        if fmt == "flat_tiffs":
-            self._metadata = load_flat_tiffs_metadata(self.input_path)
-        else:
-            self._metadata = load_ome_tiff_metadata(self.input_path)
-        return self._metadata
+    @property
+    def channels(self) -> list[str]:
+        return self.acq.metadata.channels
+
+    @property
+    def format_name(self) -> str:
+        return self.acq.format_name
+
+    def n_frames(self, channel: str) -> int:
+        """Number of 2D frames for a channel (across all FOVs)."""
+        return sum(1 for _ in self.acq.iter_frames(channel))
+
+    def n_frames_per_fov(self, channel: str) -> int:
+        """Number of z-planes / timepoints per FOV for a channel."""
+        fovs = list(self.acq.iter_fovs())
+        if not fovs:
+            return 0
+        # Use cached _find_files for individual reader, fallback to iter_frames
+        try:
+            files = self.acq._find_files(fovs[0], channel)
+            return len(files)
+        except AttributeError:
+            return sum(1 for fov_f, _, _, _ in self.acq.iter_frames(channel)
+                       if str(fov_f) == str(fovs[0]))
 
     def process_single(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Run Background2D on one 2D image. Returns (foreground, background)."""
-        img = image.astype(np.float32)
-        sigma_clip = SigmaClip(sigma=3.0)
-        bkg = Background2D(
-            img,
-            box_size=(self.box_size, self.box_size),
-            filter_size=(3, 3),
-            sigma_clip=sigma_clip,
-            bkg_estimator=MedianBackground(),
-        )
-        bg = bkg.background
-        fg = img - bg
-        return fg, bg
+        """Run background subtraction on one 2D image."""
+        return _subtract_background(image, self.box_size)
+
+    def get_frame(self, channel: str, frame_idx: int) -> np.ndarray:
+        """Load a single 2D frame (first FOV, given z/time index)."""
+        fovs = list(self.acq.iter_fovs())
+        if not fovs:
+            raise ValueError("No FOVs found")
+        return self.acq.get_frame(fovs[0], channel, frame_idx)
 
     def process_frame(
         self, channel: str, frame_idx: int
-    ) -> tuple[np.ndarray, np.ndarray, dict]:
-        """Load, process, and compute metrics for one frame. Returns (fg, bg, metrics)."""
-        meta = self.load_metadata()
-        fmt = self.detect_format()
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        """Load, process, and compute metrics for one frame.
 
-        if fmt == "flat_tiffs":
-            path = meta["file_map"][(channel, frame_idx)]
-            image = read_frame(path)
-        else:
-            ch_idx = next(
-                i for i, ch in enumerate(meta["channels"]) if ch["name"] == channel
-            )
-            page = frame_idx * meta["n_channels"] + ch_idx
-            file_idx = page // meta["n_pages_per_file"]
-            page_in_file = page % meta["n_pages_per_file"]
-            image = read_plane(meta["tiff_files"][file_idx], page_in_file)
-
+        Returns (original, foreground, background, metrics).
+        """
+        image = self.get_frame(channel, frame_idx)
         fg, bg = self.process_single(image)
-        metrics = compute_metrics(image.astype(np.float32), fg, bg)
-        return fg, bg, metrics
+        metrics = compute_metrics(image, fg, bg)
+        return image, fg, bg, metrics
+
+    def _safe_worker_count(self) -> int:
+        """Choose worker count based on available memory and frame size."""
+        try:
+            shape = self.acq.frame_shape
+            dtype = self.acq.frame_dtype
+            frame_bytes = np.prod(shape) * np.dtype(dtype).itemsize
+        except (NotImplementedError, StopIteration):
+            frame_bytes = 100 * 1024 * 1024  # assume 100 MB
+
+        per_worker_bytes = frame_bytes * _MEM_MULTIPLIER
+
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+        except (ImportError, Exception):
+            available = 4 * 1024**3
+
+        usable = max(0, available - 2 * 1024**3) * 0.75
+        mem_limited = max(1, int(usable / per_worker_bytes))
+        cpu_limited = os.cpu_count() or 1
+        return min(mem_limited, cpu_limited)
 
     def process_all(
         self,
         channels: Optional[list[str]] = None,
         progress_callback: Optional[Callable] = None,
+        max_workers: Optional[int] = None,
     ):
         """Process entire acquisition and write output TIFFs.
 
+        Uses multiprocessing for parallel frame processing.
         progress_callback(current, total, message) for GUI integration.
         """
-        meta = self.load_metadata()
-        fmt = self.detect_format()
-        self.output_path.mkdir(parents=True, exist_ok=True)
-
-        if fmt == "flat_tiffs":
-            self._process_all_flat(meta, channels, progress_callback)
-        else:
-            self._process_all_ome(meta, channels, progress_callback)
-
-    def _process_all_flat(self, meta, channels, progress_callback):
+        acq = self.acq
         if channels is None:
-            channels = meta["channels"]
+            channels = acq.metadata.channels
 
-        total = sum(meta["n_frames"][ch] for ch in channels)
-        current = 0
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        workers = max_workers or self.max_workers or self._safe_worker_count()
 
+        try:
+            dtype_str = str(acq.frame_dtype)
+        except (NotImplementedError, StopIteration):
+            dtype_str = "uint16"
+
+        # Build tasks from iter_frames — each yields (fov, z_idx, file_path, page_idx)
+        tasks = []
         for ch in channels:
-            for frame_idx in meta["frames_per_channel"][ch]:
-                path = meta["file_map"][(ch, frame_idx)]
-                image = read_frame(path)
-                fg, _bg = self.process_single(image)
+            for fov, z_idx, file_path, page_idx in acq.iter_frames(ch):
+                # Preserve original filename for individual TIFFs
+                if page_idx < 0:
+                    out_name = file_path.name
+                else:
+                    out_name = f"{file_path.stem}_page{page_idx:04d}.tiff"
+                tasks.append((
+                    str(file_path),
+                    page_idx,
+                    str(self.output_path),
+                    self.box_size,
+                    dtype_str,
+                    out_name,
+                ))
 
-                out_path = self.output_path / path.name
-                write_frame(fg, out_path, dtype=meta["dtype"])
-
-                current += 1
-                if progress_callback:
-                    progress_callback(current, total, f"{ch} frame {frame_idx}")
-
-    def _process_all_ome(self, meta, channels, progress_callback):
-        available_channels = [ch["name"] for ch in meta["channels"]]
-        if channels is None:
-            channels = available_channels
-
-        ch_indices = [available_channels.index(ch) for ch in channels]
-        n_ch = meta["n_channels"]
-        total = 0
-        for _tf in meta["tiff_files"]:
-            total += meta["n_pages_per_file"] * len(ch_indices) // n_ch
-
-        self.output_path.mkdir(parents=True, exist_ok=True)
+        total = len(tasks)
         current = 0
 
-        for tiff_path in meta["tiff_files"]:
-            n_pages = meta["n_pages_per_file"]
-            for page_idx in range(n_pages):
-                ch_in_page = page_idx % n_ch
-                if ch_in_page not in ch_indices:
-                    continue
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            # Submit in controlled batches to avoid memory blowup.
+            # Keep at most 2*workers tasks in flight.
+            pending = set()
+            task_iter = iter(tasks)
+            max_pending = workers * 2
 
-                image = read_plane(tiff_path, page_idx)
-                fg, _bg = self.process_single(image)
+            # Seed the pool
+            for t in itertools.islice(task_iter, max_pending):
+                pending.add(pool.submit(_process_frame_worker, t))
 
-                out_name = f"{tiff_path.stem}_page{page_idx:04d}.tiff"
-                write_frame(fg, self.output_path / out_name, dtype=meta["dtype"])
-
-                current += 1
-                if progress_callback:
-                    ch_name = available_channels[ch_in_page]
-                    progress_callback(current, total, f"{ch_name} page {page_idx}")
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    out_name = future.result()
+                    current += 1
+                    if progress_callback:
+                        progress_callback(current, total, out_name)
+                # Refill
+                for t in itertools.islice(task_iter, len(done)):
+                    pending.add(pool.submit(_process_frame_worker, t))

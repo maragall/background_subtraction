@@ -1,11 +1,8 @@
-#!/usr/bin/env python3
-"""Background Subtraction GUI — minimal PyQt5 interface."""
-
+"""Background Subtraction GUI — Cephla-styled PyQt5 interface."""
 import sys
 import os
 from pathlib import Path
 
-# Fix Qt plugin path for conda environments on macOS
 if sys.platform == "darwin" and "CONDA_PREFIX" in os.environ:
     conda_plugins = Path(os.environ["CONDA_PREFIX"]) / "plugins"
     if conda_plugins.exists() and "QT_PLUGIN_PATH" not in os.environ:
@@ -13,24 +10,12 @@ if sys.platform == "darwin" and "CONDA_PREFIX" in os.environ:
 
 import numpy as np
 from PyQt5.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QCheckBox,
-    QGroupBox,
-    QFileDialog,
-    QProgressBar,
-    QComboBox,
-    QSlider,
-    QSpinBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QFileDialog, QLabel, QComboBox, QProgressBar,
+    QGroupBox, QSpinBox, QSlider,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap
-
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter
 
 STYLE_SHEET = """
 QGroupBox {
@@ -43,49 +28,105 @@ QGroupBox::title {
     subcontrol-position: top left;
     padding: 0 4px;
 }
-QPushButton#runButton {
-    background-color: #0071e3;
-    color: white;
-    font-weight: bold;
-    border: none;
+QPushButton {
+    border: 1px solid #999;
     border-radius: 6px;
-    padding: 10px 20px;
+    padding: 8px 16px;
+    background: white;
 }
-QPushButton#runButton:hover {
-    background-color: #0077ed;
+QPushButton:hover {
+    background: #f0f0f0;
+    border-color: #666;
 }
-QPushButton#runButton:disabled {
-    background-color: #c7c7cc;
+QPushButton:disabled {
+    background: #f5f5f5;
+    border-color: #ccc;
+    color: #aaa;
 }
-QPushButton#autoButton {
-    background-color: #5856d6;
-    color: white;
-    font-weight: bold;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 12px;
-}
-QPushButton#autoButton:hover {
-    background-color: #6866e0;
-}
-QPushButton#autoButton:disabled {
-    background-color: #c7c7cc;
+QPushButton:pressed {
+    background: #e0e0e0;
 }
 QProgressBar {
     border: none;
     border-radius: 4px;
     height: 6px;
+    background: rgba(49, 196, 243, 0.15);
 }
 QProgressBar::chunk {
-    background-color: #0071e3;
+    background-color: rgba(49, 196, 243, 0.6);
     border-radius: 4px;
 }
 """
 
+SLIDER_STYLE = """
+QSlider::groove:horizontal {
+    height: 15px;
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(128, 128, 128, 0.25),
+        stop:1 rgba(128, 128, 128, 0.1)
+    );
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    width: 38px;
+    background: #999999;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(100, 100, 100, 0.25),
+        stop:1 rgba(100, 100, 100, 0.1)
+    );
+}
+"""
+
+PREVIEW_W = 400
+
+
+# ── Workers ───────────────────────────────────────────────────────────────
+
+def _make_thumbnail(arr, max_w=PREVIEW_W):
+    """Downsample + normalize to uint8. Runs in worker thread."""
+    import cv2
+    h, w = arr.shape
+    scale = min(1.0, max_w / w)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    small = cv2.resize(arr.astype(np.float32), (nw, nh), interpolation=cv2.INTER_AREA)
+    p1, p99 = np.percentile(small, [0.5, 99])
+    out = np.clip((small - p1) / (p99 - p1 + 1e-6) * 255, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(out)
+
+
+class PreviewWorker(QThread):
+    finished = pyqtSignal(bytes, int, int, bytes, int, int, dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, subtractor, channel, frame_idx):
+        super().__init__()
+        self.subtractor = subtractor
+        self.channel = channel
+        self.frame_idx = frame_idx
+
+    def run(self):
+        try:
+            original, fg, bg, metrics = self.subtractor.process_frame(
+                self.channel, self.frame_idx
+            )
+            before = _make_thumbnail(original)
+            after = _make_thumbnail(np.clip(fg, 0, None))
+            self.finished.emit(
+                before.tobytes(), before.shape[1], before.shape[0],
+                after.tobytes(), after.shape[1], after.shape[0],
+                metrics,
+            )
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{e}\n{traceback.format_exc()}")
+
 
 class ProcessWorker(QThread):
-    """Background worker for batch processing."""
-
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -99,7 +140,7 @@ class ProcessWorker(QThread):
         try:
             self.subtractor.process_all(
                 channels=self.channels,
-                progress_callback=lambda cur, tot, msg: self.progress.emit(cur, tot, msg),
+                progress_callback=lambda c, t, m: self.progress.emit(c, t, m),
             )
             self.finished.emit()
         except Exception as e:
@@ -107,52 +148,108 @@ class ProcessWorker(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
-class PreviewWorker(QThread):
-    """Single-frame preview worker."""
-
-    finished = pyqtSignal(object, object, object, object)  # original, fg, bg, metrics
+class MovieWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, subtractor, channel, frame_idx):
+    def __init__(self, subtractor, output_path):
         super().__init__()
         self.subtractor = subtractor
-        self.channel = channel
-        self.frame_idx = frame_idx
+        self.output_path = Path(output_path)
 
     def run(self):
         try:
-            meta = self.subtractor.load_metadata()
-            fmt = self.subtractor.detect_format()
+            import cv2, sep as _sep, tifffile
 
-            if fmt == "flat_tiffs":
-                from bgsub.io import read_frame
-                path = meta["file_map"][(self.channel, self.frame_idx)]
-                original = read_frame(path).astype(np.float32)
-            else:
-                from bgsub.io import read_plane
-                ch_idx = next(
-                    i for i, ch in enumerate(meta["channels"]) if ch["name"] == self.channel
-                )
-                page = self.frame_idx * meta["n_channels"] + ch_idx
-                file_idx = page // meta["n_pages_per_file"]
-                page_in_file = page % meta["n_pages_per_file"]
-                original = read_plane(meta["tiff_files"][file_idx], page_in_file).astype(
-                    np.float32
-                )
+            acq = self.subtractor.acq
+            channels = acq.metadata.channels
+            fovs = list(acq.iter_fovs())
+            if not fovs:
+                self.error.emit("No FOVs found")
+                return
 
-            fg, bg = self.subtractor.process_single(original)
-            from bgsub.metrics import compute_metrics
-            metrics = compute_metrics(original, fg, bg)
-            self.finished.emit(original, fg, bg, metrics)
+            box = self.subtractor.box_size
+            self.output_path.mkdir(parents=True, exist_ok=True)
+
+            for ch in channels:
+                files = acq._find_files(fovs[0], ch)
+                n_frames = len(files)
+                if n_frames == 0:
+                    continue
+
+                first = tifffile.imread(str(files[0][1]))
+                h, w = first.shape
+
+                # Half-res per pane, two panes side by side
+                scale = 0.5
+                pw = int(w * scale) // 2 * 2
+                ph = int(h * scale) // 2 * 2
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+                out_path = self.output_path / f"bgsub_{ch}.mp4"
+                writer = cv2.VideoWriter(
+                    str(out_path), fourcc, 30, (pw * 2, ph), isColor=False
+                )
+                if not writer.isOpened():
+                    self.error.emit(f"Failed to open video writer for {out_path}")
+                    return
+
+                # Normalization from samples
+                sample_idx = list(range(0, n_frames, max(1, n_frames // 10)))
+                raw_his, fg_his = [], []
+                for si in sample_idx:
+                    img = tifffile.imread(str(files[si][1])).astype(np.float32)
+                    bkg = _sep.Background(
+                        np.ascontiguousarray(img), bw=box, bh=box, fw=3, fh=3
+                    )
+                    fg = np.clip(img - bkg.back(), 0, None)
+                    raw_his.append(np.percentile(img, 99))
+                    pos = fg[fg > 0]
+                    if len(pos) > 0:
+                        fg_his.append(np.percentile(pos, 99))
+                raw_hi = np.median(raw_his) if raw_his else 1
+                fg_hi = np.median(fg_his) if fg_his else 1
+
+                for i, (idx, path) in enumerate(files):
+                    img = np.ascontiguousarray(
+                        tifffile.imread(str(path)).astype(np.float32)
+                    )
+                    bkg = _sep.Background(img, bw=box, bh=box, fw=3, fh=3)
+                    fg = np.clip(img - bkg.back(), 0, None)
+
+                    raw_u8 = np.clip(
+                        img / (raw_hi + 1e-6) * 255, 0, 255
+                    ).astype(np.uint8)
+                    fg_u8 = np.clip(
+                        fg / (fg_hi + 1e-6) * 255, 0, 255
+                    ).astype(np.uint8)
+
+                    raw_r = cv2.resize(raw_u8, (pw, ph), interpolation=cv2.INTER_AREA)
+                    fg_r = cv2.resize(fg_u8, (pw, ph), interpolation=cv2.INTER_AREA)
+                    frame = np.hstack([raw_r, fg_r])
+                    cv2.putText(
+                        frame, "Raw", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2,
+                    )
+                    cv2.putText(
+                        frame, "Subtracted", (pw + 10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2,
+                    )
+                    writer.write(frame)
+
+                    if (i + 1) % 30 == 0 or i == n_frames - 1:
+                        self.progress.emit(f"{ch} {i+1}/{n_frames}")
+                writer.release()
+
+            self.finished.emit(str(self.output_path))
         except Exception as e:
             import traceback
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
 class AutoBoxSizeWorker(QThread):
-    """Worker to auto-detect optimal box size."""
-
-    finished = pyqtSignal(int, object)  # best_box_size, all_metrics
+    finished = pyqtSignal(int, object)
     error = pyqtSignal(str)
 
     def __init__(self, subtractor, channel, frame_idx):
@@ -163,23 +260,7 @@ class AutoBoxSizeWorker(QThread):
 
     def run(self):
         try:
-            meta = self.subtractor.load_metadata()
-            fmt = self.subtractor.detect_format()
-
-            if fmt == "flat_tiffs":
-                from bgsub.io import read_frame
-                path = meta["file_map"][(self.channel, self.frame_idx)]
-                image = read_frame(path)
-            else:
-                from bgsub.io import read_plane
-                ch_idx = next(
-                    i for i, ch in enumerate(meta["channels"]) if ch["name"] == self.channel
-                )
-                page = self.frame_idx * meta["n_channels"] + ch_idx
-                file_idx = page // meta["n_pages_per_file"]
-                page_in_file = page % meta["n_pages_per_file"]
-                image = read_plane(meta["tiff_files"][file_idx], page_in_file)
-
+            image = self.subtractor.get_frame(self.channel, self.frame_idx)
             from bgsub.metrics import suggest_box_size
             best_bs, all_metrics = suggest_box_size(image)
             self.finished.emit(best_bs, all_metrics)
@@ -188,364 +269,589 @@ class AutoBoxSizeWorker(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
-def ndarray_to_qpixmap(arr: np.ndarray, max_width: int = 400) -> QPixmap:
-    """Convert a 2D float array to a QPixmap for display."""
-    p1, p99 = np.percentile(arr, [0.5, 99.5])
-    normalized = np.clip((arr - p1) / (p99 - p1 + 1e-6) * 255, 0, 255).astype(np.uint8)
+# ── Axis Slider ───────────────────────────────────────────────────────────
 
-    h, w = normalized.shape
-    scale = min(1.0, max_width / w)
-    if scale < 1.0:
-        step_h = max(1, h // int(h * scale))
-        step_w = max(1, w // int(w * scale))
-        normalized = normalized[::step_h, ::step_w]
-        h, w = normalized.shape
+class AxisSlider(QWidget):
+    """Label + slider + spinbox for one axis. Only visible when axis has >1 value."""
+    valueChanged = pyqtSignal(int)
 
-    normalized = np.ascontiguousarray(normalized)
-    qimg = QImage(normalized.data, w, h, w, QImage.Format_Grayscale8)
-    return QPixmap.fromImage(qimg.copy())
+    def __init__(self, label_text, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
 
+        self._label = QLabel(label_text)
+        self._label.setFixedWidth(50)
+        layout.addWidget(self._label)
+
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setMinimum(0)
+        self._slider.setMaximum(0)
+        self._slider.valueChanged.connect(self._on_slider)
+        layout.addWidget(self._slider, 1)
+
+        self._spin = QSpinBox()
+        self._spin.setMinimum(0)
+        self._spin.setMaximum(0)
+        self._spin.setFixedWidth(70)
+        self._spin.valueChanged.connect(self._on_spin)
+        layout.addWidget(self._spin)
+
+        self._info = QLabel("0/0")
+        self._info.setFixedWidth(60)
+        self._info.setStyleSheet("color: #86868b; font-size: 11px;")
+        layout.addWidget(self._info)
+
+        self.setVisible(False)
+
+    def setup(self, max_val, start=None):
+        if max_val <= 0:
+            self.setVisible(False)
+            return
+        self.setVisible(True)
+        self._slider.blockSignals(True)
+        self._spin.blockSignals(True)
+        self._slider.setMaximum(max_val)
+        self._spin.setMaximum(max_val)
+        val = start if start is not None else max_val // 2
+        self._slider.setValue(val)
+        self._spin.setValue(val)
+        self._info.setText(f"{val}/{max_val}")
+        self._slider.blockSignals(False)
+        self._spin.blockSignals(False)
+
+    def _on_slider(self, val):
+        self._spin.blockSignals(True)
+        self._spin.setValue(val)
+        self._spin.blockSignals(False)
+        self._info.setText(f"{val}/{self._slider.maximum()}")
+        self.valueChanged.emit(val)
+
+    def _on_spin(self, val):
+        self._slider.blockSignals(True)
+        self._slider.setValue(val)
+        self._slider.blockSignals(False)
+        self._info.setText(f"{val}/{self._slider.maximum()}")
+        self.valueChanged.emit(val)
+
+    def value(self):
+        return self._slider.value()
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._slider.setEnabled(enabled)
+        self._spin.setEnabled(enabled)
+
+
+# ── Main Window ───────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Background Subtraction")
-        self.setMinimumSize(850, 700)
-        self.setAcceptDrops(True)
+        self.setWindowTitle("Cephla Background Subtraction")
+        self.setMinimumWidth(860)
 
         self._subtractor = None
-        self._metadata = None
         self._preview_worker = None
         self._process_worker = None
+        self._movie_worker = None
         self._auto_worker = None
+        self._pending_movie = False  # True = run movie after subtraction finishes
+
         self._preview_timer = QTimer()
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(300)
+        self._preview_timer.setInterval(200)
         self._preview_timer.timeout.connect(self._do_preview)
 
+        self._setup_ui()
+        self._set_cephla_icon()
+        self.setStyleSheet(STYLE_SHEET)
+
+    def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
 
-        # --- Input group ---
-        input_group = QGroupBox("Input")
-        input_layout = QVBoxLayout(input_group)
+        # ── Acquisition ──────────────────────────────────────────────
+        acq_group = QGroupBox("Acquisition")
+        acq_layout = QVBoxLayout(acq_group)
 
-        browse_row = QHBoxLayout()
-        self._input_label = QLabel("No folder selected")
-        self._input_label.setWordWrap(True)
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self._on_browse_input)
-        browse_row.addWidget(self._input_label, 1)
-        browse_row.addWidget(browse_btn)
-        input_layout.addLayout(browse_row)
+        self.drop_label = QLabel("Drop acquisition folder here\nor click to browse")
+        self.drop_label.setAlignment(Qt.AlignCenter)
+        self.drop_label.setFixedHeight(60)
+        self.drop_label.setStyleSheet(
+            "QLabel { border: 2px dashed #aaa; border-radius: 6px; "
+            "color: #888; background: #fafafa; }"
+        )
+        self.drop_label.setCursor(Qt.PointingHandCursor)
+        self.drop_label.setAcceptDrops(True)
+        self.drop_label.mousePressEvent = lambda _: self._browse_acquisition()
+        self.drop_label.dragEnterEvent = self._drag_enter
+        self.drop_label.dragLeaveEvent = self._drag_leave
+        self.drop_label.dropEvent = self._drop
+        acq_layout.addWidget(self.drop_label)
 
-        self._info_label = QLabel("")
-        input_layout.addWidget(self._info_label)
-        layout.addWidget(input_group)
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #86868b; font-size: 11px;")
+        acq_layout.addWidget(self.info_label)
 
-        # --- Parameters group ---
-        params_group = QGroupBox("Parameters")
-        params_layout = QVBoxLayout(params_group)
+        layout.addWidget(acq_group)
 
-        # Box size
-        box_row = QHBoxLayout()
-        box_row.addWidget(QLabel("Box Size:"))
-        self._box_slider = QSlider(Qt.Horizontal)
-        self._box_slider.setRange(10, 500)
-        self._box_slider.setValue(50)
-        self._box_slider.valueChanged.connect(self._on_box_changed)
-        box_row.addWidget(self._box_slider, 1)
-        self._box_spin = QSpinBox()
-        self._box_spin.setRange(10, 500)
-        self._box_spin.setValue(50)
-        self._box_spin.valueChanged.connect(self._on_box_spin_changed)
-        box_row.addWidget(self._box_spin)
-        self._auto_btn = QPushButton("Auto-detect")
-        self._auto_btn.setObjectName("autoButton")
-        self._auto_btn.setEnabled(False)
-        self._auto_btn.clicked.connect(self._on_auto_box)
-        box_row.addWidget(self._auto_btn)
-        params_layout.addLayout(box_row)
-
-        # Channel checkboxes (populated dynamically)
-        self._channel_row = QHBoxLayout()
-        self._channel_row.addWidget(QLabel("Channels:"))
-        self._channel_checks = []
-        self._channel_container = QWidget()
-        self._channel_container_layout = QHBoxLayout(self._channel_container)
-        self._channel_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._channel_row.addWidget(self._channel_container, 1)
-        params_layout.addLayout(self._channel_row)
-
-        # Output path
-        output_row = QHBoxLayout()
-        output_row.addWidget(QLabel("Output:"))
-        self._output_label = QLabel("(auto)")
-        self._output_label.setWordWrap(True)
-        output_row.addWidget(self._output_label, 1)
-        output_btn = QPushButton("Browse...")
-        output_btn.clicked.connect(self._on_browse_output)
-        output_row.addWidget(output_btn)
-        params_layout.addLayout(output_row)
-
-        layout.addWidget(params_group)
-
-        # --- Preview group ---
+        # ── Preview ──────────────────────────────────────────────────
         preview_group = QGroupBox("Preview")
         preview_layout = QVBoxLayout(preview_group)
 
         images_row = QHBoxLayout()
-        self._orig_preview = QLabel("Original")
-        self._orig_preview.setAlignment(Qt.AlignCenter)
-        self._orig_preview.setMinimumSize(380, 280)
-        self._orig_preview.setStyleSheet("border: 1px solid #ccc;")
-        self._fg_preview = QLabel("Subtracted")
-        self._fg_preview.setAlignment(Qt.AlignCenter)
-        self._fg_preview.setMinimumSize(380, 280)
-        self._fg_preview.setStyleSheet("border: 1px solid #ccc;")
-        images_row.addWidget(self._orig_preview)
-        images_row.addWidget(self._fg_preview)
+        self._before_label = QLabel("Before")
+        self._before_label.setAlignment(Qt.AlignCenter)
+        self._before_label.setMinimumSize(PREVIEW_W, 300)
+        self._before_label.setStyleSheet("border: 1px solid #ddd; background: #111;")
+        self._after_label = QLabel("After")
+        self._after_label.setAlignment(Qt.AlignCenter)
+        self._after_label.setMinimumSize(PREVIEW_W, 300)
+        self._after_label.setStyleSheet("border: 1px solid #ddd; background: #111;")
+        images_row.addWidget(self._before_label)
+        images_row.addWidget(self._after_label)
         preview_layout.addLayout(images_row)
 
-        controls_row = QHBoxLayout()
-        controls_row.addWidget(QLabel("Frame:"))
-        self._frame_slider = QSlider(Qt.Horizontal)
-        self._frame_slider.setRange(0, 0)
-        self._frame_slider.valueChanged.connect(self._schedule_preview)
-        controls_row.addWidget(self._frame_slider, 1)
-        self._frame_label = QLabel("0/0")
-        controls_row.addWidget(self._frame_label)
-        controls_row.addWidget(QLabel("Channel:"))
-        self._channel_combo = QComboBox()
-        self._channel_combo.currentTextChanged.connect(self._on_channel_combo_changed)
-        controls_row.addWidget(self._channel_combo)
-        preview_layout.addLayout(controls_row)
+        # Channel selector
+        ch_row = QHBoxLayout()
+        ch_row.addWidget(QLabel("Channel:"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.setEnabled(False)
+        self.channel_combo.currentTextChanged.connect(self._schedule_preview)
+        ch_row.addWidget(self.channel_combo, 1)
+        preview_layout.addLayout(ch_row)
+
+        # Axis sliders (ndviewer-style, with spinbox for punch-in)
+        slider_container = QWidget()
+        slider_container.setStyleSheet(SLIDER_STYLE)
+        slider_layout = QVBoxLayout(slider_container)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(2)
+
+        self._fov_slider = AxisSlider("FOV")
+        self._fov_slider.valueChanged.connect(self._schedule_preview)
+        slider_layout.addWidget(self._fov_slider)
+
+        self._z_slider = AxisSlider("Z")
+        self._z_slider.valueChanged.connect(self._schedule_preview)
+        slider_layout.addWidget(self._z_slider)
+
+        self._t_slider = AxisSlider("Frame")
+        self._t_slider.valueChanged.connect(self._schedule_preview)
+        slider_layout.addWidget(self._t_slider)
+
+        preview_layout.addWidget(slider_container)
 
         self._metrics_label = QLabel("")
+        self._metrics_label.setStyleSheet("color: #86868b; font-size: 11px;")
         preview_layout.addWidget(self._metrics_label)
 
         layout.addWidget(preview_group)
 
-        # --- Run section ---
-        run_row = QHBoxLayout()
-        self._run_btn = QPushButton("Run All")
-        self._run_btn.setObjectName("runButton")
-        self._run_btn.setEnabled(False)
-        self._run_btn.clicked.connect(self._on_run)
-        run_row.addWidget(self._run_btn)
-        layout.addLayout(run_row)
+        # ── Parameters ───────────────────────────────────────────────
+        params_group = QGroupBox("Parameters")
+        params_layout = QHBoxLayout(params_group)
 
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setVisible(False)
-        layout.addWidget(self._progress_bar)
+        params_layout.addWidget(QLabel("Box Size:"))
+        self.box_spin = QSpinBox()
+        self.box_spin.setRange(10, 500)
+        self.box_spin.setValue(50)
+        self.box_spin.setToolTip("Background mesh box size in pixels")
+        self.box_spin.valueChanged.connect(self._schedule_preview)
+        params_layout.addWidget(self.box_spin)
 
-        self._status_label = QLabel("")
-        layout.addWidget(self._status_label)
+        self.auto_btn = QPushButton("Auto-detect")
+        self.auto_btn.setEnabled(False)
+        self.auto_btn.setCursor(Qt.PointingHandCursor)
+        self.auto_btn.setToolTip("Try several box sizes and pick the best")
+        self.auto_btn.clicked.connect(self._on_auto_box)
+        params_layout.addWidget(self.auto_btn)
 
-        self.setStyleSheet(STYLE_SHEET)
+        params_layout.addStretch()
 
-    # --- Drag and drop ---
-    def dragEnterEvent(self, event: QDragEnterEvent):
+        params_layout.addWidget(QLabel("Output:"))
+        self.output_label = QLabel("(auto)")
+        self.output_label.setStyleSheet("color: #86868b;")
+        params_layout.addWidget(self.output_label)
+        output_btn = QPushButton("Change...")
+        output_btn.setToolTip("Choose where subtracted files are saved")
+        output_btn.clicked.connect(self._select_output)
+        params_layout.addWidget(output_btn)
+
+        layout.addWidget(params_group)
+
+        # ── Actions ──────────────────────────────────────────────────
+        action_row = QHBoxLayout()
+
+        self.run_btn = QPushButton("Run Background Subtraction")
+        self.run_btn.setEnabled(False)
+        self.run_btn.setCursor(Qt.PointingHandCursor)
+        self.run_btn.setToolTip("Process all channels and frames")
+        self.run_btn.clicked.connect(self._run_processing)
+        action_row.addWidget(self.run_btn)
+
+        action_row.addStretch()
+
+        self.movie_btn = QPushButton("Generate Movie")
+        self.movie_btn.setEnabled(False)
+        self.movie_btn.setCursor(Qt.PointingHandCursor)
+        self.movie_btn.setToolTip(
+            "Generate a side-by-side before/after MP4 for each channel"
+        )
+        self.movie_btn.clicked.connect(self._generate_movie)
+        action_row.addWidget(self.movie_btn)
+
+        layout.addLayout(action_row)
+
+        # ── Progress ─────────────────────────────────────────────────
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #86868b;")
+        layout.addWidget(self.status_label)
+
+        self.view_btn = QPushButton("View Output")
+        self.view_btn.setVisible(False)
+        self.view_btn.setCursor(Qt.PointingHandCursor)
+        self.view_btn.clicked.connect(self._view_output)
+        layout.addWidget(self.view_btn)
+
+        layout.addStretch()
+
+        # ── Branding ─────────────────────────────────────────────────
+        brand_widget = QWidget()
+        brand_layout = QHBoxLayout(brand_widget)
+        brand_layout.setContentsMargins(0, 4, 0, 6)
+        brand_layout.setSpacing(5)
+        brand_layout.addStretch()
+        logo_path = Path(__file__).parent / "cephla_logo.svg"
+        if logo_path.exists():
+            try:
+                from PyQt5.QtSvg import QSvgRenderer
+                logo_label = QLabel()
+                renderer = QSvgRenderer(str(logo_path))
+                pm = QPixmap(16, 16)
+                pm.fill(Qt.transparent)
+                p = QPainter(pm)
+                renderer.render(p)
+                p.end()
+                logo_label.setPixmap(pm)
+                brand_layout.addWidget(logo_label)
+            except ImportError:
+                pass
+        brand_text = QLabel("cephla")
+        brand_text.setStyleSheet("color: #31c4f3; font-size: 10px; letter-spacing: 3px;")
+        brand_layout.addWidget(brand_text)
+        brand_layout.addStretch()
+        layout.addWidget(brand_widget)
+
+    def _set_cephla_icon(self):
+        logo_path = Path(__file__).parent / "cephla_logo.svg"
+        if logo_path.exists():
+            try:
+                from PyQt5.QtSvg import QSvgRenderer
+                renderer = QSvgRenderer(str(logo_path))
+                pixmap = QPixmap(64, 64)
+                pixmap.fill(Qt.transparent)
+                painter = QPainter(pixmap)
+                renderer.render(painter)
+                painter.end()
+                self.setWindowIcon(QIcon(pixmap))
+            except ImportError:
+                pass
+
+    # ── Drag and drop ─────────────────────────────────────────────────
+
+    def _drag_enter(self, event):
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and Path(url.toLocalFile()).is_dir():
+                    event.acceptProposedAction()
+                    self.drop_label.setStyleSheet(
+                        "QLabel { border: 2px dashed #34c759; border-radius: 6px; "
+                        "color: #34c759; background: #f0fff4; }"
+                    )
+                    return
+        event.ignore()
 
-    def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            self._load_input(path)
+    def _drag_leave(self, event):
+        if self._subtractor:
+            self.drop_label.setStyleSheet(
+                "QLabel { border: 2px solid #34c759; border-radius: 6px; "
+                "color: #333; background: #f0fff4; }"
+            )
+        else:
+            self.drop_label.setStyleSheet(
+                "QLabel { border: 2px dashed #aaa; border-radius: 6px; "
+                "color: #888; background: #fafafa; }"
+            )
 
-    # --- Input ---
-    def _on_browse_input(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select acquisition folder")
-        if folder:
-            self._load_input(folder)
+    def _drop(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if Path(path).is_dir():
+                self._load_acquisition(path)
+                return
+        self._drag_leave(event)
 
-    def _load_input(self, path: str):
+    # ── Acquisition ───────────────────────────────────────────────────
+
+    def _browse_acquisition(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Acquisition Folder")
+        if path:
+            self._load_acquisition(path)
+
+    def _load_acquisition(self, path):
         from bgsub.core import BackgroundSubtractor
 
-        self._input_label.setText(path)
-        self._status_label.setText("Detecting format...")
+        self.status_label.setText("Loading...")
+        QApplication.processEvents()
 
         try:
-            self._subtractor = BackgroundSubtractor(path, box_size=self._box_slider.value())
-            fmt = self._subtractor.detect_format()
-            self._metadata = self._subtractor.load_metadata()
+            self._subtractor = BackgroundSubtractor(
+                path, box_size=self.box_spin.value()
+            )
+            acq = self._subtractor.acq
         except Exception as e:
-            self._info_label.setText(f"Error: {e}")
+            self.info_label.setText(f"Error: {e}")
             self._subtractor = None
-            self._metadata = None
-            self._run_btn.setEnabled(False)
-            self._auto_btn.setEnabled(False)
-            self._status_label.setText("")
+            self.status_label.setText("")
             return
 
-        # Populate channels
-        for cb in self._channel_checks:
-            self._channel_container_layout.removeWidget(cb)
-            cb.deleteLater()
-        self._channel_checks.clear()
-        self._channel_combo.clear()
+        self.drop_label.setText(Path(path).name)
+        self.drop_label.setStyleSheet(
+            "QLabel { border: 2px solid #34c759; border-radius: 6px; "
+            "color: #333; background: #f0fff4; }"
+        )
 
-        if fmt == "flat_tiffs":
-            channels = self._metadata["channels"]
-            info = f"Format: flat_tiffs | Channels: {', '.join(channels)}"
-            n_frames = list(self._metadata["n_frames"].values())[0]
-            info += f" | Frames/ch: {n_frames}"
-            info += f" | Size: {self._metadata['shape']}"
-        else:
-            channels = [ch["name"] for ch in self._metadata["channels"]]
-            info = f"Format: ome_tiff | Channels: {', '.join(channels)}"
-            info += f" | Z: {self._metadata['n_z']} | T: {self._metadata['n_t']}"
-            info += f" | Files: {self._metadata['n_files']}"
-            n_frames = self._metadata["n_pages_per_file"] // max(len(channels), 1)
+        channels = self._subtractor.channels
+        meta = acq.metadata
 
-        self._info_label.setText(info)
-
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
         for ch in channels:
-            cb = QCheckBox(ch)
-            cb.setChecked(True)
-            self._channel_checks.append(cb)
-            self._channel_container_layout.addWidget(cb)
-            self._channel_combo.addItem(ch)
+            self.channel_combo.addItem(ch)
+        self.channel_combo.setEnabled(True)
+        self.channel_combo.blockSignals(False)
 
-        self._frame_slider.setRange(0, max(0, n_frames - 1))
-        self._frame_slider.setValue(0)
-        self._frame_label.setText(f"0/{max(0, n_frames - 1)}")
+        # Setup axis sliders
+        n_fovs = sum(1 for _ in acq.iter_fovs())
+        n_frames = self._subtractor.n_frames_per_fov(channels[0])
 
-        self._output_label.setText(str(self._subtractor.output_path))
+        self._fov_slider.setup(max(0, n_fovs - 1), start=0)
+        self._z_slider.setup(0)  # hidden unless we know it's a z-stack
 
-        self._run_btn.setEnabled(True)
-        self._auto_btn.setEnabled(True)
-        self._status_label.setText("Ready.")
-        self._schedule_preview()
+        # Label the frame slider based on what we know
+        has_json = (Path(path) / "acquisition_parameters.json").exists() or \
+                   (Path(path) / "acquisition parameters.json").exists()
+        if has_json and meta.nz > 1:
+            self._t_slider._label.setText("Z")
+        elif has_json and meta.nt > 1:
+            self._t_slider._label.setText("Time")
+        else:
+            self._t_slider._label.setText("FOV")
+        self._t_slider.setup(max(0, n_frames - 1), start=n_frames // 2)
 
-    # --- Output ---
-    def _on_browse_output(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select output folder")
-        if folder and self._subtractor:
-            self._subtractor.output_path = Path(folder)
-            self._output_label.setText(folder)
+        self.info_label.setText(
+            f"Format: {self._subtractor.format_name} | "
+            f"Channels: {', '.join(channels)} | "
+            f"FOVs: {n_fovs} | Frames/FOV: {n_frames}"
+        )
+        self.output_label.setText(str(self._subtractor.output_path))
 
-    # --- Box size ---
-    def _on_box_changed(self, value):
-        self._box_spin.blockSignals(True)
-        self._box_spin.setValue(value)
-        self._box_spin.blockSignals(False)
-        if self._subtractor:
-            self._subtractor.box_size = value
-        self._schedule_preview()
+        self.run_btn.setEnabled(True)
+        self.auto_btn.setEnabled(True)
+        self.movie_btn.setEnabled(True)
+        self.status_label.setText("")
 
-    def _on_box_spin_changed(self, value):
-        self._box_slider.blockSignals(True)
-        self._box_slider.setValue(value)
-        self._box_slider.blockSignals(False)
-        if self._subtractor:
-            self._subtractor.box_size = value
-        self._schedule_preview()
+        QTimer.singleShot(50, self._do_preview)
 
-    def _on_auto_box(self):
-        if not self._subtractor or not self._metadata:
-            return
-        self._auto_btn.setEnabled(False)
-        self._status_label.setText("Auto-detecting optimal box size...")
+    def _select_output(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if path and self._subtractor:
+            self._subtractor.output_path = Path(path)
+            self.output_label.setText(path)
 
-        ch = self._channel_combo.currentText()
-        frame = self._frame_slider.value()
+    # ── Preview ───────────────────────────────────────────────────────
 
-        self._auto_worker = AutoBoxSizeWorker(self._subtractor, ch, frame)
-        self._auto_worker.finished.connect(self._on_auto_box_done)
-        self._auto_worker.error.connect(self._on_worker_error)
-        self._auto_worker.start()
-
-    def _on_auto_box_done(self, best_box, all_metrics):
-        self._box_slider.setValue(best_box)
-        self._auto_btn.setEnabled(True)
-        self._status_label.setText(f"Auto-detected box size: {best_box}")
-
-    # --- Preview ---
-    def _on_channel_combo_changed(self):
-        self._schedule_preview()
+    def _get_frame_idx(self):
+        """Combine axis sliders into a single frame index."""
+        # Z and T sliders map to frame index; only one is active
+        if self._z_slider.isVisible():
+            return self._z_slider.value()
+        return self._t_slider.value()
 
     def _schedule_preview(self):
-        self._preview_timer.start()
+        if self._subtractor:
+            self._preview_timer.start()
 
     def _do_preview(self):
-        if not self._subtractor or not self._metadata:
+        if not self._subtractor:
             return
-
-        ch = self._channel_combo.currentText()
-        frame = self._frame_slider.value()
-        self._frame_label.setText(f"{frame}/{self._frame_slider.maximum()}")
-
+        ch = self.channel_combo.currentText()
         if not ch:
             return
 
+        self._subtractor.box_size = self.box_spin.value()
+        frame = self._get_frame_idx()
+
         if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.terminate()
-            self._preview_worker.wait()
+            return
 
         self._preview_worker = PreviewWorker(self._subtractor, ch, frame)
         self._preview_worker.finished.connect(self._update_preview)
-        self._preview_worker.error.connect(self._on_worker_error)
+        self._preview_worker.error.connect(self._on_error)
         self._preview_worker.start()
 
-    def _update_preview(self, original, fg, bg, metrics):
-        preview_w = self._orig_preview.width() - 4
-        self._orig_preview.setPixmap(ndarray_to_qpixmap(original, max_width=preview_w))
-        self._fg_preview.setPixmap(
-            ndarray_to_qpixmap(np.clip(fg, 0, None), max_width=preview_w)
-        )
+    def _update_preview(self, before_bytes, bw, bh, after_bytes, aw, ah, metrics):
+        before_img = QImage(before_bytes, bw, bh, bw, QImage.Format_Grayscale8)
+        after_img = QImage(after_bytes, aw, ah, aw, QImage.Format_Grayscale8)
+        self._before_label.setPixmap(QPixmap.fromImage(before_img))
+        self._after_label.setPixmap(QPixmap.fromImage(after_img))
         self._metrics_label.setText(
-            f"SNR: {metrics['snr_improvement']:.2f}x | "
-            f"BG uniformity: {metrics['bg_uniformity']:.4f} | "
-            f"Signal preservation: {metrics['signal_preservation']:.4f} | "
+            f"SNR: {metrics['snr_improvement']:.2f}x  |  "
+            f"BG uniformity: {metrics['bg_uniformity']:.4f}  |  "
+            f"Signal preservation: {metrics['signal_preservation']:.4f}  |  "
             f"Neg pixels: {metrics['negative_pixel_pct']:.2f}%"
         )
 
-    # --- Run ---
-    def _on_run(self):
+    # ── Buttons disable/enable ────────────────────────────────────────
+
+    def _set_running(self, running):
+        has_sub = self._subtractor is not None
+        self.run_btn.setEnabled(not running and has_sub)
+        self.auto_btn.setEnabled(not running and has_sub)
+        self.movie_btn.setEnabled(not running and has_sub)
+        self._fov_slider.setEnabled(not running)
+        self._z_slider.setEnabled(not running)
+        self._t_slider.setEnabled(not running)
+        self.channel_combo.setEnabled(not running and has_sub)
+        self.progress_bar.setVisible(running)
+        if running:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setMaximum(0)
+
+    # ── Auto box size ─────────────────────────────────────────────────
+
+    def _on_auto_box(self):
         if not self._subtractor:
             return
-
-        selected_channels = [
-            cb.text() for cb in self._channel_checks if cb.isChecked()
-        ]
-        if not selected_channels:
-            self._status_label.setText("No channels selected.")
+        ch = self.channel_combo.currentText()
+        if not ch:
             return
+        self._set_running(True)
+        self.status_label.setText("Auto-detecting optimal box size...")
+        self._auto_worker = AutoBoxSizeWorker(
+            self._subtractor, ch, self._get_frame_idx()
+        )
+        self._auto_worker.finished.connect(self._on_auto_box_done)
+        self._auto_worker.error.connect(self._on_error)
+        self._auto_worker.start()
 
-        self._run_btn.setEnabled(False)
-        self._progress_bar.setVisible(True)
-        self._progress_bar.setValue(0)
-        self._status_label.setText("Processing...")
+    def _on_auto_box_done(self, best_box, all_metrics):
+        self.box_spin.setValue(best_box)
+        if self._subtractor:
+            self._subtractor.box_size = best_box
+        self._set_running(False)
+        self.status_label.setText(f"Auto-detected box size: {best_box}")
 
-        self._process_worker = ProcessWorker(self._subtractor, selected_channels)
+    # ── Full processing ───────────────────────────────────────────────
+
+    def _run_processing(self):
+        if not self._subtractor:
+            return
+        self._subtractor.box_size = self.box_spin.value()
+        channels = self._subtractor.channels
+        if not channels:
+            return
+        self._process_worker = ProcessWorker(self._subtractor, channels)
         self._process_worker.progress.connect(self._on_progress)
         self._process_worker.finished.connect(self._on_run_finished)
-        self._process_worker.error.connect(self._on_worker_error)
+        self._process_worker.error.connect(self._on_error)
+        self._set_running(True)
+        self.progress_bar.setMaximum(100)
         self._process_worker.start()
 
     def _on_progress(self, current, total, message):
-        pct = int(100 * current / total) if total > 0 else 0
-        self._progress_bar.setValue(pct)
-        self._status_label.setText(f"{message} ({current}/{total})")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.status_label.setText(f"{message} ({current}/{total})")
 
     def _on_run_finished(self):
-        self._run_btn.setEnabled(True)
-        self._progress_bar.setVisible(False)
-        self._status_label.setText(
-            f"Done! Output: {self._subtractor.output_path}"
+        self._set_running(False)
+        self.view_btn.setVisible(True)
+        self.status_label.setText(f"Done! Output: {self._subtractor.output_path}")
+
+        # If movie was pending, chain into movie generation
+        if self._pending_movie:
+            self._pending_movie = False
+            self._start_movie()
+
+    # ── Generate Movie ────────────────────────────────────────────────
+
+    def _has_subtracted_output(self):
+        """Check if the output folder already has subtracted images."""
+        out = self._subtractor.output_path
+        if not out.exists():
+            return False
+        return any(out.glob("*.tiff")) or any(out.glob("*.tif"))
+
+    def _generate_movie(self):
+        if not self._subtractor:
+            return
+        self._subtractor.box_size = self.box_spin.value()
+
+        if self._has_subtracted_output():
+            self._start_movie()
+        else:
+            self._pending_movie = True
+            self.status_label.setText("Running background subtraction first...")
+            self._run_processing()
+
+    def _start_movie(self):
+        movie_dir = self._subtractor.output_path.parent / "movies"
+        self._movie_worker = MovieWorker(self._subtractor, movie_dir)
+        self._movie_worker.progress.connect(
+            lambda msg: self.status_label.setText(f"Movie: {msg}")
         )
+        self._movie_worker.finished.connect(self._on_movie_finished)
+        self._movie_worker.error.connect(self._on_error)
+        self._set_running(True)
+        self._movie_worker.start()
 
-    def _on_worker_error(self, msg):
-        self._run_btn.setEnabled(True)
-        self._auto_btn.setEnabled(True)
-        self._progress_bar.setVisible(False)
-        self._status_label.setText(f"Error: {msg.split(chr(10))[0]}")
-        print(f"Worker error:\n{msg}", file=sys.stderr)
+    def _on_movie_finished(self, output_path):
+        self._set_running(False)
+        self.status_label.setText(f"Movies saved to {output_path}")
 
+    # ── View output ───────────────────────────────────────────────────
+
+    def _view_output(self):
+        import subprocess
+        output_dir = str(self._subtractor.output_path)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", output_dir])
+        elif sys.platform == "win32":
+            subprocess.Popen(["explorer", output_dir])
+        else:
+            subprocess.Popen(["xdg-open", output_dir])
+
+    # ── Error handling ────────────────────────────────────────────────
+
+    def _on_error(self, message):
+        self._set_running(False)
+        self.status_label.setText(f"Error: {message.split(chr(10))[0]}")
+        print(f"Worker error:\n{message}", file=sys.stderr)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────
 
 def main():
     src_dir = str(Path(__file__).parent.parent / "src")

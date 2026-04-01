@@ -1,8 +1,7 @@
 """Quality metrics for background subtraction evaluation."""
 
 import numpy as np
-from astropy.stats import SigmaClip
-from photutils.background import Background2D, MedianBackground
+import sep
 
 
 def compute_metrics(original: np.ndarray, foreground: np.ndarray, background: np.ndarray) -> dict:
@@ -39,19 +38,12 @@ def suggest_box_size(
     if candidates is None:
         candidates = [25, 50, 100, 200, 400]
 
-    img = image.astype(np.float32) if image.dtype != np.float32 else image
-    sigma_clip = SigmaClip(sigma=3.0)
+    img = np.ascontiguousarray(image, dtype=np.float32)
     all_metrics = {}
 
     for bs in candidates:
-        bkg = Background2D(
-            img,
-            box_size=(bs, bs),
-            filter_size=(3, 3),
-            sigma_clip=sigma_clip,
-            bkg_estimator=MedianBackground(),
-        )
-        bg = bkg.background
+        bkg = sep.Background(img, bw=bs, bh=bs, fw=3, fh=3)
+        bg = bkg.back()
         fg = img - bg
         all_metrics[bs] = compute_metrics(img, fg, bg)
 
