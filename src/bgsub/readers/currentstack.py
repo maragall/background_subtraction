@@ -4,13 +4,13 @@ From petakit/Deconvolution.
 """
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import tifffile
 
-from .base import AcquisitionReader, Metadata, FOV, FrameRef
+from .base import FOV, AcquisitionReader, FrameRef, Metadata
 
 _PATTERN = re.compile(r"^(.+?)_(\d+)_stack\.tiff$")
 

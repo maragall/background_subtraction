@@ -85,7 +85,7 @@ def make_ometiff_fixture(tmp_path):
             # Page order matches DimensionOrder XYCZT → C varies fastest, then Z
             pages = []
             for z in range(z_planes):
-                for c, ch in enumerate(channels):
+                for c, _ch in enumerate(channels):
                     pages.append(_make_image(shape, seed=fov_idx * 100 + z * 10 + c))
             arr = np.stack(pages, axis=0)
             path = ome_dir / f"R0_{fov_idx}.ome.tiff"

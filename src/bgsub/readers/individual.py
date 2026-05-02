@@ -3,14 +3,13 @@
 From petakit/Deconvolution — supports both standard and single_band naming.
 """
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import tifffile
 
-from .base import AcquisitionReader, Metadata, FOV, FrameRef
-
+from .base import FOV, AcquisitionReader, FrameRef, Metadata
 
 # Standard: {region}_{fov}_{z}_Fluorescence_{wavelength}_nm_Ex.tiff
 _STD_PATTERN = re.compile(r"Fluorescence_(\d+)_nm_Ex")

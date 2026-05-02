@@ -1,6 +1,5 @@
 """Tests for IndividualReader. Uses synthetic fixtures from conftest.py."""
 import numpy as np
-import pytest
 
 from bgsub.readers import FrameRef, open_acquisition
 from bgsub.readers.individual import IndividualReader

@@ -1,12 +1,12 @@
 """Reader for OME-TIFF format (from petakit/Deconvolution)."""
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import tifffile
 
-from .base import AcquisitionReader, Metadata, FOV, FrameRef
+from .base import FOV, AcquisitionReader, FrameRef, Metadata
 
 
 def detect_ometiff(root: Path) -> bool:

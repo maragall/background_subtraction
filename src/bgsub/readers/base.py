@@ -1,12 +1,11 @@
 """Abstract acquisition reader interface (from petakit)."""
+import json
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
-import json
 
 import numpy as np
-import tifffile
 
 
 @dataclass

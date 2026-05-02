@@ -1,6 +1,6 @@
 """Background Subtraction GUI — Cephla-styled PyQt5 interface."""
-import sys
 import os
+import sys
 from pathlib import Path
 
 if sys.platform == "darwin" and "CONDA_PREFIX" in os.environ:
@@ -10,15 +10,24 @@ if sys.platform == "darwin" and "CONDA_PREFIX" in os.environ:
 
 import cv2
 import numpy as np
-import sep
 import tifffile
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFileDialog, QLabel, QComboBox, QProgressBar,
-    QGroupBox, QSpinBox, QSlider,
-)
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter
+from PyQt5.QtGui import QIcon, QImage, QPainter, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 from bgsub.core import BackgroundSubtractor
 
