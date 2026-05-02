@@ -10,7 +10,7 @@ from typing import Iterator
 import numpy as np
 import tifffile
 
-from .base import AcquisitionReader, Metadata, FOV
+from .base import AcquisitionReader, Metadata, FOV, FrameRef
 
 _PATTERN = re.compile(r"^(.+?)_(\d+)_stack\.tiff$")
 
@@ -39,9 +39,14 @@ def open_currentstack(root: Path) -> "CurrentStackReader":
     if plane_dir is None:
         raise FileNotFoundError("No *_stack.tiff files found")
 
-    first_file = next(f for f in sorted(plane_dir.glob("*_stack.tiff")) if _PATTERN.match(f.name))
+    first_file = next(
+        f for f in sorted(plane_dir.glob("*_stack.tiff")) if _PATTERN.match(f.name)
+    )
+
+    # Parse channels from page descriptions of the first file
     channels = []
     nz = 0
+    wl_pattern = re.compile(r"(\d{3})\s*nm")
     with tifffile.TiffFile(str(first_file)) as tif:
         ch_set = set()
         z_set = set()
@@ -50,7 +55,6 @@ def open_currentstack(root: Path) -> "CurrentStackReader":
             ch_set.add(meta["channel"])
             z_set.add(meta["z_level"])
         nz = len(z_set)
-        wl_pattern = re.compile(r"(\d{3})\s*nm")
         for ch in sorted(ch_set):
             m = wl_pattern.search(ch)
             channels.append(m.group(1) if m else ch)
@@ -68,10 +72,29 @@ class CurrentStackReader(AcquisitionReader):
     def __init__(self, root: Path, metadata: Metadata, plane_dir: Path):
         super().__init__(root, metadata)
         self._plane_dir = plane_dir
+        # path -> {(channel_wavelength, z_level): page_idx}
+        self._page_index: dict[Path, dict[tuple[str, int], int]] = {}
 
     @property
     def format_name(self) -> str:
         return "currentstack"
+
+    def _path_for_fov(self, fov: FOV) -> Path:
+        return self._plane_dir / f"{fov.region}_{fov.index}_stack.tiff"
+
+    def _index_for(self, path: Path) -> dict[tuple[str, int], int]:
+        if path in self._page_index:
+            return self._page_index[path]
+        wl_pattern = re.compile(r"(\d{3})\s*nm")
+        idx: dict[tuple[str, int], int] = {}
+        with tifffile.TiffFile(str(path)) as tif:
+            for page_idx, page in enumerate(tif.pages):
+                meta = json.loads(page.description)
+                m = wl_pattern.search(meta["channel"])
+                wavelength = m.group(1) if m else meta["channel"]
+                idx[(wavelength, meta["z_level"])] = page_idx
+        self._page_index[path] = idx
+        return idx
 
     def iter_fovs(self) -> Iterator[FOV]:
         seen = set()
@@ -84,58 +107,63 @@ class CurrentStackReader(AcquisitionReader):
                     seen.add(key)
                     yield FOV(region=region, index=idx)
 
-    def get_frame(self, fov: FOV, channel: str, z_idx: int) -> np.ndarray:
-        """Load a single z-plane."""
-        path = self._plane_dir / f"{fov.region}_{fov.index}_stack.tiff"
+    def iter_frames_for_fov(self, fov: FOV, channel: str):
+        path = self._path_for_fov(fov)
         if not path.exists():
-            raise FileNotFoundError(f"Stack file not found: {path}")
+            return
+        idx = self._index_for(path)
+        for (ch, z), page_idx in sorted(idx.items(), key=lambda kv: kv[0][1]):
+            if ch == channel:
+                yield FrameRef(fov=fov, frame_idx=z, file_path=path, page_idx=page_idx)
 
-        with tifffile.TiffFile(str(path)) as tif:
-            for page in tif.pages:
-                meta = json.loads(page.description)
-                if channel in meta["channel"] and meta["z_level"] == z_idx:
-                    return page.asarray().astype(np.float32)
-
-        raise ValueError(f"z={z_idx} channel '{channel}' not found in {path.name}")
+    def n_frames_per_fov(self, fov: FOV, channel: str) -> int:
+        path = self._path_for_fov(fov)
+        if not path.exists():
+            return 0
+        idx = self._index_for(path)
+        return sum(1 for (ch, _z) in idx if ch == channel)
 
     def iter_frames(self, channel: str):
-        """Yield (fov, z_idx, file_path, page_idx) for parallel processing."""
         for fov in self.iter_fovs():
-            path = self._plane_dir / f"{fov.region}_{fov.index}_stack.tiff"
-            if not path.exists():
-                continue
-            with tifffile.TiffFile(str(path)) as tif:
-                for page_idx, page in enumerate(tif.pages):
-                    meta = json.loads(page.description)
-                    if channel in meta["channel"]:
-                        yield fov, meta["z_level"], path, page_idx
+            yield from self.iter_frames_for_fov(fov, channel)
+
+    def get_frame(self, fov: FOV, channel: str, z_idx: int) -> np.ndarray:
+        path = self._path_for_fov(fov)
+        if not path.exists():
+            raise FileNotFoundError(f"Stack file not found: {path}")
+        idx = self._index_for(path)
+        if (channel, z_idx) not in idx:
+            raise ValueError(f"z={z_idx} channel '{channel}' not found in {path.name}")
+        page_idx = idx[(channel, z_idx)]
+        with tifffile.TiffFile(str(path)) as tif:
+            return tif.pages[page_idx].asarray().astype(np.float32)
+
+    def get_stack(self, fov: FOV, channel: str) -> np.ndarray:
+        path = self._path_for_fov(fov)
+        if not path.exists():
+            raise FileNotFoundError(f"Stack file not found: {path}")
+        idx = self._index_for(path)
+        z_pages = sorted(((z, p) for (ch, z), p in idx.items() if ch == channel))
+        if not z_pages:
+            raise ValueError(f"Channel '{channel}' not found in {path.name}")
+        with tifffile.TiffFile(str(path)) as tif:
+            slices = [tif.pages[p].asarray() for _z, p in z_pages]
+        return np.stack(slices, axis=0).astype(np.float32)
 
     @property
     def frame_shape(self) -> tuple:
-        first_file = next(f for f in sorted(self._plane_dir.glob("*_stack.tiff")) if _PATTERN.match(f.name))
+        first_file = next(
+            f for f in sorted(self._plane_dir.glob("*_stack.tiff"))
+            if _PATTERN.match(f.name)
+        )
         with tifffile.TiffFile(str(first_file)) as tf:
             return tf.pages[0].shape
 
     @property
     def frame_dtype(self):
-        first_file = next(f for f in sorted(self._plane_dir.glob("*_stack.tiff")) if _PATTERN.match(f.name))
+        first_file = next(
+            f for f in sorted(self._plane_dir.glob("*_stack.tiff"))
+            if _PATTERN.match(f.name)
+        )
         with tifffile.TiffFile(str(first_file)) as tf:
             return tf.pages[0].dtype
-
-    def get_stack(self, fov: FOV, channel: str) -> np.ndarray:
-        path = self._plane_dir / f"{fov.region}_{fov.index}_stack.tiff"
-        if not path.exists():
-            raise FileNotFoundError(f"Stack file not found: {path}")
-
-        slices = {}
-        with tifffile.TiffFile(str(path)) as tif:
-            for page in tif.pages:
-                meta = json.loads(page.description)
-                if channel in meta["channel"]:
-                    slices[meta["z_level"]] = page.asarray()
-
-        if not slices:
-            raise ValueError(f"Channel '{channel}' not found in {path.name}")
-
-        stack = np.stack([slices[z] for z in sorted(slices)], axis=0)
-        return stack.astype(np.float32)
