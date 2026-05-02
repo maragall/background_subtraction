@@ -182,10 +182,31 @@ class MovieWorker(QThread):
         self.subtractor = subtractor
         self.output_path = Path(output_path)
 
+    def _read_ref(self, ref):
+        if ref.page_idx is None:
+            return tifffile.imread(str(ref.file_path))
+        return tifffile.imread(str(ref.file_path), key=ref.page_idx)
+
+    def _compute_normalization(self, refs):
+        """Sample frames evenly, return (raw_hi, fg_hi) percentile medians."""
+        step = max(1, len(refs) // _NORMALIZATION_SAMPLES)
+        sample_refs = [refs[i] for i in range(0, len(refs), step)]
+        raw_his, fg_his = [], []
+        for ref in sample_refs:
+            img = self._read_ref(ref).astype(np.float32)
+            fg, _ = self.subtractor.process_single(img)
+            fg_pos = np.clip(fg, 0, None)
+            raw_his.append(np.percentile(img, _NORMALIZATION_PERCENTILE))
+            pos = fg_pos[fg_pos > 0]
+            if len(pos) > 0:
+                fg_his.append(np.percentile(pos, _NORMALIZATION_PERCENTILE))
+        return (
+            float(np.median(raw_his)) if raw_his else 1.0,
+            float(np.median(fg_his)) if fg_his else 1.0,
+        )
+
     def run(self):
         try:
-            import cv2, sep as _sep, tifffile
-
             acq = self.subtractor.acq
             channels = acq.metadata.channels
             fovs = list(acq.iter_fovs())
@@ -193,77 +214,54 @@ class MovieWorker(QThread):
                 self.error.emit("No FOVs found")
                 return
 
-            box = self.subtractor.box_size
             self.output_path.mkdir(parents=True, exist_ok=True)
 
             for ch in channels:
-                files = acq._find_files(fovs[0], ch)
-                n_frames = len(files)
-                if n_frames == 0:
+                refs = list(acq.iter_frames_for_fov(fovs[0], ch))
+                if not refs:
                     continue
 
-                first = tifffile.imread(str(files[0][1]))
+                first = self._read_ref(refs[0])
                 h, w = first.shape
-
-                # Half-res per pane, two panes side by side
-                scale = 0.5
-                pw = int(w * scale) // 2 * 2
-                ph = int(h * scale) // 2 * 2
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-
+                # Half-res per pane, two panes side by side, even dimensions
+                pw = (w // 2 // 2) * 2
+                ph = (h // 2 // 2) * 2
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 out_path = self.output_path / f"bgsub_{ch}.mp4"
                 writer = cv2.VideoWriter(
-                    str(out_path), fourcc, 30, (pw * 2, ph), isColor=False
+                    str(out_path), fourcc, _MOVIE_FPS, (pw * 2, ph), isColor=False
                 )
                 if not writer.isOpened():
                     self.error.emit(f"Failed to open video writer for {out_path}")
                     return
 
-                # Normalization from samples
-                sample_idx = list(range(0, n_frames, max(1, n_frames // 10)))
-                raw_his, fg_his = [], []
-                for si in sample_idx:
-                    img = tifffile.imread(str(files[si][1])).astype(np.float32)
-                    bkg = _sep.Background(
-                        np.ascontiguousarray(img), bw=box, bh=box, fw=3, fh=3
-                    )
-                    fg = np.clip(img - bkg.back(), 0, None)
-                    raw_his.append(np.percentile(img, 99))
-                    pos = fg[fg > 0]
-                    if len(pos) > 0:
-                        fg_his.append(np.percentile(pos, 99))
-                raw_hi = np.median(raw_his) if raw_his else 1
-                fg_hi = np.median(fg_his) if fg_his else 1
+                raw_hi, fg_hi = self._compute_normalization(refs)
 
-                for i, (idx, path) in enumerate(files):
-                    img = np.ascontiguousarray(
-                        tifffile.imread(str(path)).astype(np.float32)
-                    )
-                    bkg = _sep.Background(img, bw=box, bh=box, fw=3, fh=3)
-                    fg = np.clip(img - bkg.back(), 0, None)
+                for i, ref in enumerate(refs):
+                    img = self._read_ref(ref).astype(np.float32)
+                    fg, _ = self.subtractor.process_single(img)
+                    fg = np.clip(fg, 0, None)
 
-                    raw_u8 = np.clip(
-                        img / (raw_hi + 1e-6) * 255, 0, 255
-                    ).astype(np.uint8)
-                    fg_u8 = np.clip(
-                        fg / (fg_hi + 1e-6) * 255, 0, 255
-                    ).astype(np.uint8)
+                    raw_u8 = np.clip(img / (raw_hi + 1e-6) * 255, 0, 255).astype(np.uint8)
+                    fg_u8 = np.clip(fg / (fg_hi + 1e-6) * 255, 0, 255).astype(np.uint8)
 
                     raw_r = cv2.resize(raw_u8, (pw, ph), interpolation=cv2.INTER_AREA)
                     fg_r = cv2.resize(fg_u8, (pw, ph), interpolation=cv2.INTER_AREA)
                     frame = np.hstack([raw_r, fg_r])
                     cv2.putText(
                         frame, "Raw", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2,
+                        cv2.FONT_HERSHEY_SIMPLEX, _MOVIE_FONT_SCALE, 255,
+                        _MOVIE_FONT_THICKNESS,
                     )
                     cv2.putText(
                         frame, "Subtracted", (pw + 10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, 255, 2,
+                        cv2.FONT_HERSHEY_SIMPLEX, _MOVIE_FONT_SCALE, 255,
+                        _MOVIE_FONT_THICKNESS,
                     )
                     writer.write(frame)
 
-                    if (i + 1) % 30 == 0 or i == n_frames - 1:
-                        self.progress.emit(f"{ch} {i+1}/{n_frames}")
+                    if (i + 1) % _MOVIE_FPS == 0 or i == len(refs) - 1:
+                        self.progress.emit(f"{ch} {i+1}/{len(refs)}")
                 writer.release()
 
             self.finished.emit(str(self.output_path))
