@@ -87,13 +87,7 @@ class FrameRef:
 
 
 class AcquisitionReader(ABC):
-    """Abstract base for acquisition format readers.
-
-    Subclasses must implement:
-        - format_name: str property
-        - iter_fovs(): Iterator[FOV]
-        - get_stack(fov, channel): np.ndarray
-    """
+    """Abstract base for acquisition format readers."""
 
     def __init__(self, root: Path, metadata: Metadata):
         self.root = root
@@ -101,17 +95,27 @@ class AcquisitionReader(ABC):
 
     @property
     @abstractmethod
-    def format_name(self) -> str:
-        pass
+    def format_name(self) -> str: ...
 
     @abstractmethod
-    def iter_fovs(self) -> Iterator[FOV]:
-        pass
+    def iter_fovs(self) -> Iterator[FOV]: ...
 
     @abstractmethod
-    def get_stack(self, fov: FOV, channel: str) -> np.ndarray:
-        """Load a z-stack for given FOV and channel. Returns (Z, Y, X) array."""
-        pass
+    def get_stack(self, fov: FOV, channel: str) -> np.ndarray: ...
+
+    @abstractmethod
+    def iter_frames_for_fov(self, fov: FOV, channel: str) -> Iterator[FrameRef]: ...
+
+    @abstractmethod
+    def n_frames_per_fov(self, fov: FOV, channel: str) -> int: ...
+
+    @property
+    @abstractmethod
+    def frame_shape(self) -> tuple: ...
+
+    @property
+    @abstractmethod
+    def frame_dtype(self): ...
 
     def get_frame(self, fov: FOV, channel: str, z_idx: int) -> np.ndarray:
         """Load a single 2D frame. Default: load full stack and index."""
@@ -120,44 +124,10 @@ class AcquisitionReader(ABC):
             return stack[min(z_idx, stack.shape[0] - 1)]
         return stack
 
-    def iter_frames_for_fov(self, fov: FOV, channel: str) -> Iterator["FrameRef"]:
-        """Yield FrameRef for every 2D frame in this FOV+channel, in frame_idx order.
-
-        Subclasses must override.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement iter_frames_for_fov"
-        )
-
-    def n_frames_per_fov(self, fov: FOV, channel: str) -> int:
-        """Number of 2D frames for one FOV+channel.
-
-        Subclasses must override.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement n_frames_per_fov"
-        )
-
-    def iter_frames(self, channel: str):
-        """Yield (fov, z_idx, file_path, page_idx) for every 2D frame.
-
-        file_path + page_idx allow direct tifffile.imread(path, key=page)
-        without loading full stacks — critical for parallel workers.
-        Subclasses should override for efficiency.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support iter_frames"
-        )
-
-    @property
-    def frame_shape(self) -> tuple:
-        """Return (H, W) of a single frame."""
-        raise NotImplementedError
-
-    @property
-    def frame_dtype(self):
-        """Return dtype of frames."""
-        raise NotImplementedError
+    def iter_frames(self, channel: str) -> Iterator[FrameRef]:
+        """Yield FrameRef for every 2D frame across all FOVs."""
+        for fov in self.iter_fovs():
+            yield from self.iter_frames_for_fov(fov, channel)
 
     def get_all_channels(self, fov: FOV) -> dict[str, np.ndarray]:
         return {ch: self.get_stack(fov, ch) for ch in self.metadata.channels}

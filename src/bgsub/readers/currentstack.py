@@ -123,10 +123,6 @@ class CurrentStackReader(AcquisitionReader):
         idx = self._index_for(path)
         return sum(1 for (ch, _z) in idx if ch == channel)
 
-    def iter_frames(self, channel: str):
-        for fov in self.iter_fovs():
-            yield from self.iter_frames_for_fov(fov, channel)
-
     def get_frame(self, fov: FOV, channel: str, z_idx: int) -> np.ndarray:
         path = self._path_for_fov(fov)
         if not path.exists():

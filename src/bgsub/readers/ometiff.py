@@ -113,10 +113,6 @@ class OMETiffReader(AcquisitionReader):
             return 0
         return self._nz_for_file(filepath)
 
-    def iter_frames(self, channel: str):
-        for fov in self.iter_fovs():
-            yield from self.iter_frames_for_fov(fov, channel)
-
     def get_stack(self, fov: FOV, channel: str) -> np.ndarray:
         filepath = self._file_for_fov(fov)
         if not filepath.exists():

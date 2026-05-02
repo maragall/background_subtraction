@@ -169,10 +169,6 @@ class IndividualReader(AcquisitionReader):
     def n_frames_per_fov(self, fov: FOV, channel: str) -> int:
         return len(self._find_files(fov, channel))
 
-    def iter_frames(self, channel: str):
-        for fov in self.iter_fovs():
-            yield from self.iter_frames_for_fov(fov, channel)
-
     @property
     def frame_shape(self) -> tuple:
         f = next(self._tiff_dir.glob("*_Fluorescence_*"))
