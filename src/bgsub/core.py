@@ -2,50 +2,56 @@
 
 import itertools
 import os
-import shutil
-from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
+import psutil
 import sep
 import tifffile
 
-from .readers import open_acquisition
 from .metrics import compute_metrics
+from .readers import open_acquisition
 
-# sep uses ~3x the raw frame size in peak memory per worker.
-_MEM_MULTIPLIER = 3
+# sep peak ~2x input + 1x output buffer per worker.
+_MEM_PER_WORKER_MULTIPLIER = 3
+# Leave 2 GB for OS + main process.
+_MEM_HEADROOM_BYTES = 2 * 1024**3
+# Don't fully saturate available memory; reserve 25% for spikes.
+_MEM_USE_FRACTION = 0.75
+# Keep workers fed without unbounded queue growth.
+_PENDING_TASKS_PER_WORKER = 2
+# sep's documented filter-window default.
+_SEP_FILTER_SIZE = 3
+# Cephla microscopy default; user-overridable in GUI/API.
+_DEFAULT_BOX_SIZE = 50
 
 
-def _subtract_background(image: np.ndarray, box_size: int) -> tuple[np.ndarray, np.ndarray]:
-    """Run sep.Background on one 2D image. Returns (foreground, background)."""
+def _run_sep(image: np.ndarray, box_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Run sep.Background on one 2D image. Returns (foreground, background) in float32."""
     img = np.ascontiguousarray(image, dtype=np.float32)
-    bkg = sep.Background(img, bw=box_size, bh=box_size, fw=3, fh=3)
+    bkg = sep.Background(
+        img, bw=box_size, bh=box_size, fw=_SEP_FILTER_SIZE, fh=_SEP_FILTER_SIZE
+    )
     bg = bkg.back()
-    fg = img - bg
-    return fg, bg
+    return img - bg, bg
 
 
 def _process_frame_worker(args):
-    """Picklable worker: read frame from file, subtract background, write output."""
-    file_path_str, page_idx, output_dir, box_size, dtype_str, out_name = args
-    import sep as _sep, numpy as _np, tifffile as _tf
-
-    if page_idx >= 0:
-        image = _tf.imread(file_path_str, key=page_idx)
-    else:
-        image = _tf.imread(file_path_str)
-
-    img = _np.ascontiguousarray(image, dtype=_np.float32)
-    bkg = _sep.Background(img, bw=box_size, bh=box_size, fw=3, fh=3)
-    fg = img - bkg.back()
-
+    """Picklable worker: read one frame, subtract background, write output TIFF."""
+    file_path, page_idx, output_dir, box_size, dtype_str, out_name = args
+    image = (
+        tifffile.imread(file_path)
+        if page_idx is None
+        else tifffile.imread(file_path, key=page_idx)
+    )
+    fg, _ = _run_sep(image, box_size)
     out_path = Path(output_dir) / out_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    info = _np.iinfo(_np.dtype(dtype_str))
-    clipped = _np.clip(fg, info.min, info.max).astype(_np.dtype(dtype_str))
-    _tf.imwrite(str(out_path), clipped)
+    info = np.iinfo(np.dtype(dtype_str))
+    out = np.clip(fg, info.min, info.max).astype(np.dtype(dtype_str))
+    tifffile.imwrite(str(out_path), out)
     return out_name
 
 
@@ -73,8 +79,8 @@ class BackgroundSubtractor:
         self,
         input_path,
         output_path=None,
-        box_size=50,
-        max_workers=None,
+        box_size: int = _DEFAULT_BOX_SIZE,
+        max_workers: Optional[int] = None,
     ):
         self.input_path = Path(input_path)
         self.output_path = (
@@ -86,7 +92,6 @@ class BackgroundSubtractor:
 
     @property
     def acq(self):
-        """Lazy-load the AcquisitionReader."""
         if self._acq is None:
             self._acq = open_acquisition(self.input_path)
         return self._acq
@@ -100,28 +105,16 @@ class BackgroundSubtractor:
         return self.acq.format_name
 
     def n_frames(self, channel: str) -> int:
-        """Number of 2D frames for a channel (across all FOVs)."""
         return sum(1 for _ in self.acq.iter_frames(channel))
 
     def n_frames_per_fov(self, channel: str) -> int:
-        """Number of z-planes / timepoints per FOV for a channel."""
         fovs = list(self.acq.iter_fovs())
-        if not fovs:
-            return 0
-        # Use cached _find_files for individual reader, fallback to iter_frames
-        try:
-            files = self.acq._find_files(fovs[0], channel)
-            return len(files)
-        except AttributeError:
-            return sum(1 for fov_f, _, _, _ in self.acq.iter_frames(channel)
-                       if str(fov_f) == str(fovs[0]))
+        return self.acq.n_frames_per_fov(fovs[0], channel) if fovs else 0
 
     def process_single(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Run background subtraction on one 2D image."""
-        return _subtract_background(image, self.box_size)
+        return _run_sep(image, self.box_size)
 
     def get_frame(self, channel: str, frame_idx: int) -> np.ndarray:
-        """Load a single 2D frame (first FOV, given z/time index)."""
         fovs = list(self.acq.iter_fovs())
         if not fovs:
             raise ValueError("No FOVs found")
@@ -130,36 +123,19 @@ class BackgroundSubtractor:
     def process_frame(
         self, channel: str, frame_idx: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
-        """Load, process, and compute metrics for one frame.
-
-        Returns (original, foreground, background, metrics).
-        """
         image = self.get_frame(channel, frame_idx)
         fg, bg = self.process_single(image)
         metrics = compute_metrics(image, fg, bg)
         return image, fg, bg, metrics
 
     def _safe_worker_count(self) -> int:
-        """Choose worker count based on available memory and frame size."""
-        try:
-            shape = self.acq.frame_shape
-            dtype = self.acq.frame_dtype
-            frame_bytes = np.prod(shape) * np.dtype(dtype).itemsize
-        except (NotImplementedError, StopIteration):
-            frame_bytes = 100 * 1024 * 1024  # assume 100 MB
-
-        per_worker_bytes = frame_bytes * _MEM_MULTIPLIER
-
-        try:
-            import psutil
-            available = psutil.virtual_memory().available
-        except (ImportError, Exception):
-            available = 4 * 1024**3
-
-        usable = max(0, available - 2 * 1024**3) * 0.75
-        mem_limited = max(1, int(usable / per_worker_bytes))
-        cpu_limited = os.cpu_count() or 1
-        return min(mem_limited, cpu_limited)
+        shape = self.acq.frame_shape
+        dtype = self.acq.frame_dtype
+        frame_bytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        available = psutil.virtual_memory().available
+        usable = max(0, available - _MEM_HEADROOM_BYTES) * _MEM_USE_FRACTION
+        mem_limited = max(1, int(usable / (frame_bytes * _MEM_PER_WORKER_MULTIPLIER)))
+        return min(mem_limited, os.cpu_count() or 1)
 
     def process_all(
         self,
@@ -169,8 +145,8 @@ class BackgroundSubtractor:
     ):
         """Process entire acquisition and write output TIFFs.
 
-        Uses multiprocessing for parallel frame processing.
-        progress_callback(current, total, message) for GUI integration.
+        progress_callback(current, total, message) is invoked from the main thread
+        as each frame completes.
         """
         acq = self.acq
         if channels is None:
@@ -178,24 +154,18 @@ class BackgroundSubtractor:
 
         self.output_path.mkdir(parents=True, exist_ok=True)
         workers = max_workers or self.max_workers or self._safe_worker_count()
+        dtype_str = str(acq.frame_dtype)
 
-        try:
-            dtype_str = str(acq.frame_dtype)
-        except (NotImplementedError, StopIteration):
-            dtype_str = "uint16"
-
-        # Build tasks from iter_frames — each yields (fov, z_idx, file_path, page_idx)
         tasks = []
         for ch in channels:
-            for fov, z_idx, file_path, page_idx in acq.iter_frames(ch):
-                # Preserve original filename for individual TIFFs
-                if page_idx < 0:
-                    out_name = file_path.name
+            for ref in acq.iter_frames(ch):
+                if ref.page_idx is None:
+                    out_name = ref.file_path.name
                 else:
-                    out_name = f"{file_path.stem}_page{page_idx:04d}.tiff"
+                    out_name = f"{ref.file_path.stem}_page{ref.page_idx:04d}.tiff"
                 tasks.append((
-                    str(file_path),
-                    page_idx,
+                    str(ref.file_path),
+                    ref.page_idx,
                     str(self.output_path),
                     self.box_size,
                     dtype_str,
@@ -204,15 +174,11 @@ class BackgroundSubtractor:
 
         total = len(tasks)
         current = 0
+        max_pending = workers * _PENDING_TASKS_PER_WORKER
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            # Submit in controlled batches to avoid memory blowup.
-            # Keep at most 2*workers tasks in flight.
             pending = set()
             task_iter = iter(tasks)
-            max_pending = workers * 2
-
-            # Seed the pool
             for t in itertools.islice(task_iter, max_pending):
                 pending.add(pool.submit(_process_frame_worker, t))
 
@@ -223,6 +189,5 @@ class BackgroundSubtractor:
                     current += 1
                     if progress_callback:
                         progress_callback(current, total, out_name)
-                # Refill
                 for t in itertools.islice(task_iter, len(done)):
                     pending.add(pool.submit(_process_frame_worker, t))
