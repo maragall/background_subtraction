@@ -6,7 +6,7 @@ Minimal background subtraction for fluorescence microscopy acquisitions, built o
 ## Install
 
 ```bash
-pip install -e .[gui]
+pip install -e '.[gui]'
 ```
 
 ## Run
@@ -34,7 +34,7 @@ sub.process_all()
 ## Development
 
 ```bash
-pip install -e .[dev,gui]
+pip install -e '.[dev,gui]'
 pytest
 ruff check .
 ```
