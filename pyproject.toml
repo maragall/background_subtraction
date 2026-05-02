@@ -30,12 +30,13 @@ dependencies = [
     "numpy>=1.21",
     "tifffile>=2023.0",
     "sep>=1.2",
-    "pyyaml>=6.0",
+    "opencv-python>=4.5",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
 gui = ["PyQt5>=5.15"]
-dev = ["ruff>=0.1"]
+dev = ["ruff>=0.1", "pytest>=7"]
 
 [project.scripts]
 bgsub-gui = "gui.app:main"
@@ -44,7 +45,10 @@ bgsub-gui = "gui.app:main"
 Repository = "https://github.com/maragall/background_subtraction"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bgsub", "gui", "scripts"]
+packages = ["src/bgsub", "gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
