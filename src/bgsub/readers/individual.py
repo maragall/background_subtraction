@@ -3,14 +3,13 @@
 From petakit/Deconvolution — supports both standard and single_band naming.
 """
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import tifffile
 
-from .base import AcquisitionReader, Metadata, FOV
-
+from .base import FOV, AcquisitionReader, FrameRef, Metadata
 
 # Standard: {region}_{fov}_{z}_Fluorescence_{wavelength}_nm_Ex.tiff
 _STD_PATTERN = re.compile(r"Fluorescence_(\d+)_nm_Ex")
@@ -161,23 +160,22 @@ class IndividualReader(AcquisitionReader):
         idx = min(z_idx, len(files_with_z) - 1)
         return tifffile.imread(files_with_z[idx][1]).astype(np.float32)
 
-    def iter_frames(self, channel: str):
-        """Yield (fov, z_idx, file_path, page_idx) for parallel processing.
+    def iter_frames_for_fov(self, fov: FOV, channel: str):
+        """Yield FrameRef for every 2D frame in this FOV+channel."""
+        for z_idx, path in self._find_files(fov, channel):
+            yield FrameRef(fov=fov, frame_idx=z_idx, file_path=path, page_idx=None)
 
-        page_idx=-1 means read the whole file (single-page TIFF).
-        """
-        for fov in self.iter_fovs():
-            for z_idx, path in self._find_files(fov, channel):
-                yield fov, z_idx, path, -1
+    def n_frames_per_fov(self, fov: FOV, channel: str) -> int:
+        return len(self._find_files(fov, channel))
 
     @property
     def frame_shape(self) -> tuple:
-        f = next(self._tiff_dir.glob("*.tiff"))
+        f = next(self._tiff_dir.glob("*_Fluorescence_*"))
         with tifffile.TiffFile(str(f)) as tf:
             return tf.pages[0].shape
 
     @property
     def frame_dtype(self):
-        f = next(self._tiff_dir.glob("*.tiff"))
+        f = next(self._tiff_dir.glob("*_Fluorescence_*"))
         with tifffile.TiffFile(str(f)) as tf:
             return tf.pages[0].dtype

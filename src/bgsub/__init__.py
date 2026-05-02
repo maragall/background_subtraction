@@ -3,4 +3,6 @@
 __version__ = "0.1.0"
 
 from .core import BackgroundSubtractor
-from .metrics import compute_metrics, suggest_box_size
+from .metrics import compute_metrics
+
+__all__ = ["BackgroundSubtractor", "compute_metrics", "__version__"]
