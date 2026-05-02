@@ -8,7 +8,10 @@ if sys.platform == "darwin" and "CONDA_PREFIX" in os.environ:
     if conda_plugins.exists() and "QT_PLUGIN_PATH" not in os.environ:
         os.environ["QT_PLUGIN_PATH"] = str(conda_plugins)
 
+import cv2
 import numpy as np
+import sep
+import tifffile
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QComboBox, QProgressBar,
@@ -16,6 +19,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter
+
+from bgsub.core import BackgroundSubtractor
 
 STYLE_SHEET = """
 QGroupBox {
@@ -83,19 +88,38 @@ QSlider::sub-page:horizontal {
 """
 
 PREVIEW_W = 400
+_NORMALIZATION_PERCENTILE = 99.0   # robust upper bound, ignores hot pixels
+_NORMALIZATION_SAMPLES = 10        # enough frames for stable median estimate
+_MOVIE_FPS = 30                    # standard playback rate
+_MOVIE_FONT_SCALE = 0.8
+_MOVIE_FONT_THICKNESS = 2
+_THUMBNAIL_PERCENTILES = (0.5, 99) # preview contrast window
+_PREVIEW_DEBOUNCE_MS = 200         # coalesce slider drags
+
+_DROP_LABEL_IDLE_STYLE = (
+    "QLabel { border: 2px dashed #aaa; border-radius: 6px; "
+    "color: #888; background: #fafafa; }"
+)
+_DROP_LABEL_HOVER_STYLE = (
+    "QLabel { border: 2px dashed #34c759; border-radius: 6px; "
+    "color: #34c759; background: #f0fff4; }"
+)
+_DROP_LABEL_LOADED_STYLE = (
+    "QLabel { border: 2px solid #34c759; border-radius: 6px; "
+    "color: #333; background: #f0fff4; }"
+)
 
 
 # ── Workers ───────────────────────────────────────────────────────────────
 
 def _make_thumbnail(arr, max_w=PREVIEW_W):
     """Downsample + normalize to uint8. Runs in worker thread."""
-    import cv2
     h, w = arr.shape
     scale = min(1.0, max_w / w)
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
     small = cv2.resize(arr.astype(np.float32), (nw, nh), interpolation=cv2.INTER_AREA)
-    p1, p99 = np.percentile(small, [0.5, 99])
-    out = np.clip((small - p1) / (p99 - p1 + 1e-6) * 255, 0, 255).astype(np.uint8)
+    p_lo, p_hi = np.percentile(small, _THUMBNAIL_PERCENTILES)
+    out = np.clip((small - p_lo) / (p_hi - p_lo + 1e-6) * 255, 0, 255).astype(np.uint8)
     return np.ascontiguousarray(out)
 
 
@@ -248,27 +272,6 @@ class MovieWorker(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
-class AutoBoxSizeWorker(QThread):
-    finished = pyqtSignal(int, object)
-    error = pyqtSignal(str)
-
-    def __init__(self, subtractor, channel, frame_idx):
-        super().__init__()
-        self.subtractor = subtractor
-        self.channel = channel
-        self.frame_idx = frame_idx
-
-    def run(self):
-        try:
-            image = self.subtractor.get_frame(self.channel, self.frame_idx)
-            from bgsub.metrics import suggest_box_size
-            best_bs, all_metrics = suggest_box_size(image)
-            self.finished.emit(best_bs, all_metrics)
-        except Exception as e:
-            import traceback
-            self.error.emit(f"{e}\n{traceback.format_exc()}")
-
-
 # ── Axis Slider ───────────────────────────────────────────────────────────
 
 class AxisSlider(QWidget):
@@ -335,6 +338,9 @@ class AxisSlider(QWidget):
         self._info.setText(f"{val}/{self._slider.maximum()}")
         self.valueChanged.emit(val)
 
+    def set_label(self, text: str):
+        self._label.setText(text)
+
     def value(self):
         return self._slider.value()
 
@@ -357,12 +363,11 @@ class MainWindow(QMainWindow):
         self._preview_worker = None
         self._process_worker = None
         self._movie_worker = None
-        self._auto_worker = None
         self._pending_movie = False  # True = run movie after subtraction finishes
 
         self._preview_timer = QTimer()
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(200)
+        self._preview_timer.setInterval(_PREVIEW_DEBOUNCE_MS)
         self._preview_timer.timeout.connect(self._do_preview)
 
         self._setup_ui()
@@ -383,10 +388,7 @@ class MainWindow(QMainWindow):
         self.drop_label = QLabel("Drop acquisition folder here\nor click to browse")
         self.drop_label.setAlignment(Qt.AlignCenter)
         self.drop_label.setFixedHeight(60)
-        self.drop_label.setStyleSheet(
-            "QLabel { border: 2px dashed #aaa; border-radius: 6px; "
-            "color: #888; background: #fafafa; }"
-        )
+        self.drop_label.setStyleSheet(_DROP_LABEL_IDLE_STYLE)
         self.drop_label.setCursor(Qt.PointingHandCursor)
         self.drop_label.setAcceptDrops(True)
         self.drop_label.mousePressEvent = lambda _: self._browse_acquisition()
@@ -438,13 +440,9 @@ class MainWindow(QMainWindow):
         self._fov_slider.valueChanged.connect(self._schedule_preview)
         slider_layout.addWidget(self._fov_slider)
 
-        self._z_slider = AxisSlider("Z")
-        self._z_slider.valueChanged.connect(self._schedule_preview)
-        slider_layout.addWidget(self._z_slider)
-
-        self._t_slider = AxisSlider("Frame")
-        self._t_slider.valueChanged.connect(self._schedule_preview)
-        slider_layout.addWidget(self._t_slider)
+        self._frame_slider = AxisSlider("Frame")
+        self._frame_slider.valueChanged.connect(self._schedule_preview)
+        slider_layout.addWidget(self._frame_slider)
 
         preview_layout.addWidget(slider_container)
 
@@ -465,13 +463,6 @@ class MainWindow(QMainWindow):
         self.box_spin.setToolTip("Background mesh box size in pixels")
         self.box_spin.valueChanged.connect(self._schedule_preview)
         params_layout.addWidget(self.box_spin)
-
-        self.auto_btn = QPushButton("Auto-detect")
-        self.auto_btn.setEnabled(False)
-        self.auto_btn.setCursor(Qt.PointingHandCursor)
-        self.auto_btn.setToolTip("Try several box sizes and pick the best")
-        self.auto_btn.clicked.connect(self._on_auto_box)
-        params_layout.addWidget(self.auto_btn)
 
         params_layout.addStretch()
 
@@ -575,24 +566,15 @@ class MainWindow(QMainWindow):
             for url in event.mimeData().urls():
                 if url.isLocalFile() and Path(url.toLocalFile()).is_dir():
                     event.acceptProposedAction()
-                    self.drop_label.setStyleSheet(
-                        "QLabel { border: 2px dashed #34c759; border-radius: 6px; "
-                        "color: #34c759; background: #f0fff4; }"
-                    )
+                    self.drop_label.setStyleSheet(_DROP_LABEL_HOVER_STYLE)
                     return
         event.ignore()
 
     def _drag_leave(self, event):
         if self._subtractor:
-            self.drop_label.setStyleSheet(
-                "QLabel { border: 2px solid #34c759; border-radius: 6px; "
-                "color: #333; background: #f0fff4; }"
-            )
+            self.drop_label.setStyleSheet(_DROP_LABEL_LOADED_STYLE)
         else:
-            self.drop_label.setStyleSheet(
-                "QLabel { border: 2px dashed #aaa; border-radius: 6px; "
-                "color: #888; background: #fafafa; }"
-            )
+            self.drop_label.setStyleSheet(_DROP_LABEL_IDLE_STYLE)
 
     def _drop(self, event):
         for url in event.mimeData().urls():
@@ -610,8 +592,6 @@ class MainWindow(QMainWindow):
             self._load_acquisition(path)
 
     def _load_acquisition(self, path):
-        from bgsub.core import BackgroundSubtractor
-
         self.status_label.setText("Loading...")
         QApplication.processEvents()
 
@@ -627,10 +607,7 @@ class MainWindow(QMainWindow):
             return
 
         self.drop_label.setText(Path(path).name)
-        self.drop_label.setStyleSheet(
-            "QLabel { border: 2px solid #34c759; border-radius: 6px; "
-            "color: #333; background: #f0fff4; }"
-        )
+        self.drop_label.setStyleSheet(_DROP_LABEL_LOADED_STYLE)
 
         channels = self._subtractor.channels
         meta = acq.metadata
@@ -647,18 +624,16 @@ class MainWindow(QMainWindow):
         n_frames = self._subtractor.n_frames_per_fov(channels[0])
 
         self._fov_slider.setup(max(0, n_fovs - 1), start=0)
-        self._z_slider.setup(0)  # hidden unless we know it's a z-stack
 
-        # Label the frame slider based on what we know
         has_json = (Path(path) / "acquisition_parameters.json").exists() or \
                    (Path(path) / "acquisition parameters.json").exists()
         if has_json and meta.nz > 1:
-            self._t_slider._label.setText("Z")
+            self._frame_slider.set_label("Z")
         elif has_json and meta.nt > 1:
-            self._t_slider._label.setText("Time")
+            self._frame_slider.set_label("Time")
         else:
-            self._t_slider._label.setText("FOV")
-        self._t_slider.setup(max(0, n_frames - 1), start=n_frames // 2)
+            self._frame_slider.set_label("FOV")
+        self._frame_slider.setup(max(0, n_frames - 1), start=n_frames // 2)
 
         self.info_label.setText(
             f"Format: {self._subtractor.format_name} | "
@@ -668,7 +643,6 @@ class MainWindow(QMainWindow):
         self.output_label.setText(str(self._subtractor.output_path))
 
         self.run_btn.setEnabled(True)
-        self.auto_btn.setEnabled(True)
         self.movie_btn.setEnabled(True)
         self.status_label.setText("")
 
@@ -683,11 +657,7 @@ class MainWindow(QMainWindow):
     # ── Preview ───────────────────────────────────────────────────────
 
     def _get_frame_idx(self):
-        """Combine axis sliders into a single frame index."""
-        # Z and T sliders map to frame index; only one is active
-        if self._z_slider.isVisible():
-            return self._z_slider.value()
-        return self._t_slider.value()
+        return self._frame_slider.value()
 
     def _schedule_preview(self):
         if self._subtractor:
@@ -728,40 +698,14 @@ class MainWindow(QMainWindow):
     def _set_running(self, running):
         has_sub = self._subtractor is not None
         self.run_btn.setEnabled(not running and has_sub)
-        self.auto_btn.setEnabled(not running and has_sub)
         self.movie_btn.setEnabled(not running and has_sub)
         self._fov_slider.setEnabled(not running)
-        self._z_slider.setEnabled(not running)
-        self._t_slider.setEnabled(not running)
+        self._frame_slider.setEnabled(not running)
         self.channel_combo.setEnabled(not running and has_sub)
         self.progress_bar.setVisible(running)
         if running:
             self.progress_bar.setValue(0)
             self.progress_bar.setMaximum(0)
-
-    # ── Auto box size ─────────────────────────────────────────────────
-
-    def _on_auto_box(self):
-        if not self._subtractor:
-            return
-        ch = self.channel_combo.currentText()
-        if not ch:
-            return
-        self._set_running(True)
-        self.status_label.setText("Auto-detecting optimal box size...")
-        self._auto_worker = AutoBoxSizeWorker(
-            self._subtractor, ch, self._get_frame_idx()
-        )
-        self._auto_worker.finished.connect(self._on_auto_box_done)
-        self._auto_worker.error.connect(self._on_error)
-        self._auto_worker.start()
-
-    def _on_auto_box_done(self, best_box, all_metrics):
-        self.box_spin.setValue(best_box)
-        if self._subtractor:
-            self._subtractor.box_size = best_box
-        self._set_running(False)
-        self.status_label.setText(f"Auto-detected box size: {best_box}")
 
     # ── Full processing ───────────────────────────────────────────────
 
