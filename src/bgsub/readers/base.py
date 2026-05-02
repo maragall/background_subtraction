@@ -73,6 +73,19 @@ class FOV:
         return f"{self.region}_{self.index}"
 
 
+@dataclass(frozen=True)
+class FrameRef:
+    """Reference to a single 2D frame inside an acquisition.
+
+    page_idx is None for single-page TIFFs (read whole file) and an integer
+    for multi-page TIFFs (read that page).
+    """
+    fov: FOV
+    frame_idx: int
+    file_path: Path
+    page_idx: int | None
+
+
 class AcquisitionReader(ABC):
     """Abstract base for acquisition format readers.
 
@@ -106,6 +119,24 @@ class AcquisitionReader(ABC):
         if stack.ndim == 3:
             return stack[min(z_idx, stack.shape[0] - 1)]
         return stack
+
+    def iter_frames_for_fov(self, fov: FOV, channel: str) -> Iterator["FrameRef"]:
+        """Yield FrameRef for every 2D frame in this FOV+channel, in frame_idx order.
+
+        Subclasses must override.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement iter_frames_for_fov"
+        )
+
+    def n_frames_per_fov(self, fov: FOV, channel: str) -> int:
+        """Number of 2D frames for one FOV+channel.
+
+        Subclasses must override.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement n_frames_per_fov"
+        )
 
     def iter_frames(self, channel: str):
         """Yield (fov, z_idx, file_path, page_idx) for every 2D frame.
