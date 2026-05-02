@@ -6,7 +6,7 @@ from typing import Iterator
 import numpy as np
 import tifffile
 
-from .base import AcquisitionReader, Metadata, FOV
+from .base import AcquisitionReader, Metadata, FOV, FrameRef
 
 
 def detect_ometiff(root: Path) -> bool:
@@ -33,16 +33,21 @@ def open_ometiff(root: Path) -> "OMETiffReader":
 
     metadata = Metadata.from_acquisition_json(json_path, channels)
 
-    return OMETiffReader(root, metadata)
+    reader = OMETiffReader(root, metadata)
+    reader._channel_indices = {ch: i for i, ch in enumerate(channels)}
+    reader._n_channels = len(channels)
+    return reader
 
 
 def _parse_channels_from_ome(ome_xml: str) -> list[str]:
-    """Extract channel wavelengths from OME-XML."""
-    channels = []
+    """Extract channel wavelengths from OME-XML, in document order, deduplicated."""
     pattern = re.compile(r'Name="Fluorescence (\d+) nm Ex"')
+    seen = []
     for match in pattern.finditer(ome_xml):
-        channels.append(match.group(1))
-    return sorted(set(channels), key=int)
+        ch = match.group(1)
+        if ch not in seen:
+            seen.append(ch)
+    return seen
 
 
 class OMETiffReader(AcquisitionReader):
@@ -52,10 +57,16 @@ class OMETiffReader(AcquisitionReader):
         root/
             acquisition_parameters.json
             ome_tiff/
-                manual0_0.ome.tiff
-                manual0_1.ome.tiff
+                <region><idx>_<n>.ome.tiff
                 ...
+
+    Page-order assumption: pages within one OME-TIFF interleave channels then
+    Z planes (DimensionOrder XYCZT), so page = z_idx * n_channels + channel_idx.
     """
+
+    # Populated by open_ometiff. Public read-only.
+    _channel_indices: dict[str, int]
+    _n_channels: int
 
     @property
     def format_name(self) -> str:
@@ -65,85 +76,62 @@ class OMETiffReader(AcquisitionReader):
     def ome_dir(self) -> Path:
         return self.root / "ome_tiff"
 
+    def _file_for_fov(self, fov: FOV) -> Path:
+        return self.ome_dir / f"{fov.region}_{fov.index}.ome.tiff"
+
     def iter_fovs(self) -> Iterator[FOV]:
         pattern = re.compile(r"^([a-zA-Z]+\d+)_(\d+)\.ome\.tiff$")
         for f in sorted(self.ome_dir.glob("*.ome.tiff")):
             if match := pattern.match(f.name):
-                region = match.group(1)
-                fov_idx = int(match.group(2))
-                yield FOV(region=region, index=fov_idx)
+                yield FOV(region=match.group(1), index=int(match.group(2)))
 
-    def get_stack(self, fov: FOV, channel: str) -> np.ndarray:
-        filename = f"{fov.region}_{fov.index}.ome.tiff"
-        filepath = self.ome_dir / filename
+    def _channel_index(self, channel: str) -> int:
+        if channel not in self._channel_indices:
+            raise ValueError(
+                f"Channel {channel} not found. Available: "
+                f"{list(self._channel_indices)}"
+            )
+        return self._channel_indices[channel]
 
-        if not filepath.exists():
-            raise FileNotFoundError(f"OME-TIFF not found: {filepath}")
-
+    def _nz_for_file(self, filepath: Path) -> int:
         with tifffile.TiffFile(filepath) as tif:
-            channel_idx = self._get_channel_index(tif.ome_metadata, channel)
+            return len(tif.pages) // max(self._n_channels, 1)
 
-            series = tif.series[0]
-            data = series.asarray()
-            axes = series.axes.upper()
-
-            if 'T' in axes:
-                t_pos = axes.index('T')
-                if data.shape[t_pos] == 1:
-                    data = np.squeeze(data, axis=t_pos)
-                    axes = axes.replace('T', '')
-
-            if 'C' in axes:
-                c_pos = axes.index('C')
-                stack = np.take(data, channel_idx, axis=c_pos)
-            else:
-                stack = data
-
-        return stack.astype(np.float32)
-
-    def get_frame(self, fov: FOV, channel: str, z_idx: int) -> np.ndarray:
-        """Load a single 2D z-plane without loading the full stack."""
-        filename = f"{fov.region}_{fov.index}.ome.tiff"
-        filepath = self.ome_dir / filename
+    def iter_frames_for_fov(self, fov: FOV, channel: str):
+        filepath = self._file_for_fov(fov)
         if not filepath.exists():
-            raise FileNotFoundError(f"OME-TIFF not found: {filepath}")
+            return
+        c_idx = self._channel_index(channel)
+        nz = self._nz_for_file(filepath)
+        for z in range(nz):
+            page = z * max(self._n_channels, 1) + c_idx
+            yield FrameRef(fov=fov, frame_idx=z, file_path=filepath, page_idx=page)
 
-        with tifffile.TiffFile(filepath) as tif:
-            channel_idx = self._get_channel_index(tif.ome_metadata, channel)
-            series = tif.series[0]
-            data = series.asarray()
-            axes = series.axes.upper()
-
-            if 'T' in axes:
-                t_pos = axes.index('T')
-                if data.shape[t_pos] == 1:
-                    data = np.squeeze(data, axis=t_pos)
-                    axes = axes.replace('T', '')
-
-            if 'C' in axes:
-                c_pos = axes.index('C')
-                stack = np.take(data, channel_idx, axis=c_pos)
-            else:
-                stack = data
-
-        if stack.ndim == 3:
-            idx = min(z_idx, stack.shape[0] - 1)
-            return stack[idx].astype(np.float32)
-        return stack.astype(np.float32)
+    def n_frames_per_fov(self, fov: FOV, channel: str) -> int:
+        filepath = self._file_for_fov(fov)
+        if not filepath.exists():
+            return 0
+        return self._nz_for_file(filepath)
 
     def iter_frames(self, channel: str):
-        """Yield (fov, z_idx, file_path, page_idx) for parallel processing."""
         for fov in self.iter_fovs():
-            filename = f"{fov.region}_{fov.index}.ome.tiff"
-            filepath = self.ome_dir / filename
-            if filepath.exists():
-                with tifffile.TiffFile(filepath) as tif:
-                    channel_idx = self._get_channel_index(tif.ome_metadata, channel)
-                    n_channels = len(set(re.findall(r'Name="Fluorescence (\d+) nm Ex"', tif.ome_metadata)))
-                    nz = len(tif.pages) // max(n_channels, 1)
-                for z_idx in range(nz):
-                    page = z_idx * max(n_channels, 1) + channel_idx
-                    yield fov, z_idx, filepath, page
+            yield from self.iter_frames_for_fov(fov, channel)
+
+    def get_stack(self, fov: FOV, channel: str) -> np.ndarray:
+        filepath = self._file_for_fov(fov)
+        if not filepath.exists():
+            raise FileNotFoundError(f"OME-TIFF not found: {filepath}")
+        c_idx = self._channel_index(channel)
+        with tifffile.TiffFile(filepath) as tif:
+            data = tif.series[0].asarray()
+            axes = tif.series[0].axes.upper()
+        return _select_channel(data, axes, c_idx).astype(np.float32)
+
+    def get_frame(self, fov: FOV, channel: str, z_idx: int) -> np.ndarray:
+        stack = self.get_stack(fov, channel)
+        if stack.ndim == 3:
+            return stack[min(z_idx, stack.shape[0] - 1)]
+        return stack
 
     @property
     def frame_shape(self) -> tuple:
@@ -157,21 +145,15 @@ class OMETiffReader(AcquisitionReader):
         with tifffile.TiffFile(first_file) as tf:
             return tf.pages[0].dtype
 
-    def _get_channel_index(self, ome_xml: str, channel: str) -> int:
-        pattern = re.compile(r'Name="Fluorescence (\d+) nm Ex"')
-        channels = []
-        for match in pattern.finditer(ome_xml):
-            channels.append(match.group(1))
 
-        seen = set()
-        unique_channels = []
-        for ch in channels:
-            if ch not in seen:
-                seen.add(ch)
-                unique_channels.append(ch)
-
-        if channel not in unique_channels:
-            raise ValueError(
-                f"Channel {channel} not found. Available: {unique_channels}"
-            )
-        return unique_channels.index(channel)
+def _select_channel(data: np.ndarray, axes: str, channel_idx: int) -> np.ndarray:
+    """Squeeze T if length 1, take given channel along C if present."""
+    if "T" in axes:
+        t_pos = axes.index("T")
+        if data.shape[t_pos] == 1:
+            data = np.squeeze(data, axis=t_pos)
+            axes = axes.replace("T", "")
+    if "C" in axes:
+        c_pos = axes.index("C")
+        return np.take(data, channel_idx, axis=c_pos)
+    return data
